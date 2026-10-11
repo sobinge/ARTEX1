@@ -289,6 +289,26 @@ server {
   CLOUDFLARE_API_TOKEN=<token> npx wrangler pages deploy out --project-name=artex-demo --branch=main
   ```
 
+### 本地运行排障
+
+**① `./start.sh` 提示「找不到可执行文件 ./artex」**
+
+`artex` 是编译产物，本仓库不托管二进制（`.gitignore` 已忽略 `/artex`）。按上文「方式四：从源码编译单二进制」先编译一次：
+
+```bash
+cd web && npm ci && npm run build:static && cd ..
+cp -r web/out server/webui/dist
+CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+./start.sh
+```
+
+**② 启动后终端不停刷「connection refused / 异常退出 → 重启」**
+
+`start.sh` 是守护脚本：artex 退出后会按退出码反复拉起（退避 1→2→4…最多 60 秒），所以数据库连不上时终端会持续刷屏。此时先 `Ctrl-C`（或 `kill` 掉 `start.sh` 进程）停止，再排查：
+
+- `config.json` 的 `database.port` / `password` 是否与本机 Postgres 实际监听一致（`docker ps` 查看端口映射；`docker-compose.yml` 里的 postgres 默认不对外发布端口，裸跑二进制时需要自行把 Postgres 端口映射到宿主）。
+- 确认数据库可连后再 `./start.sh`。连接就绪前程序会因 `open stores: ping postgres ... connection refused` 一直退出重启。
+
 ---
 
 ## 系统技术架构
