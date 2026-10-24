@@ -9,6 +9,8 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 📦 **该仓库为ARTEX最后一个版本纯源码备份。原 Docker 镜像源 `autumn27/artex` 已失效，现由本仓库自维护镜像 `mianhuatang11/artex`（Docker Hub）；拉取失败时可 `docker compose build` 从纯源码本地构建，无任何外部预编译依赖。**
 
+🕵️ **目标流量默认经 Tor 出行**：per-Agent 独立 Tor 实例池 + 出口审计 + Onion 入站，策略按「流量类别」在工具执行层强制（详见 [网络出口与隐蔽通道（Tor）](#网络出口与隐蔽通道tor)）。
+
 </div>
 
 ---
@@ -259,7 +261,105 @@ server {
 
 ---
 
+## 网络出口与隐蔽通道（Tor）
 
+目标流量**默认匿名**，而且这条策略由代码在「工具执行层」强制，不依赖提示词——模型可以无视提示词，`checkToolEgress` 不会。
+
+> 前置：需要 `tor` 可执行文件（`brew install tor` / `apt install tor`），或用 `tor_binary` 指向自带二进制。
+
+### 出站策略矩阵（按流量类别，不按 Agent）
+
+类别声明在工具上（`tools.egress_class`），因此一个配置宽松的扫描器也不会继承「直连」默认值：
+
+| 类别 | 典型流量 | 默认出口 | 可放开 |
+| --- | --- | --- | --- |
+| `target-probe` | 子域枚举、指纹识别、目录/端口探测、爬虫 | **Tor（强制匿名）** | ❌ 系统无可用匿名出口时**拒绝执行**（fail-closed） |
+| `target-exploit` | 漏洞利用、后渗透请求 | **Tor** | ✅ 任务级显式豁免，并写入审计 |
+| `intel-query` | FOFA / Shodan / Quake 等第三方情报 API | 真实 IP | ✅ 默认允许（这些平台封禁 Tor 出口）；白名单 `fofa.info`、`api.shodan.io`、`quake.360.cn` |
+| `platform-self` | 升级、工具下载、镜像拉取 | 直连 / 系统代理 | — |
+| `notify` | 告警、webhook 投递 | 直连 / 系统代理 | — |
+
+工具还可声明 `needs_udp`：命中且出口是 Tor 时**直接拒绝**（Tor 不承载 UDP），不会因「反正也是匿名」而勉强放行。被拒时的报错是显式的：
+
+```
+出口策略拒绝执行(target-probe, agent=worker): 无可用匿名出口；不会回退直连
+```
+
+相关设置：`egress_strict`（fail-closed 总闸）、`global_proxy`（全局出口代理）、`tor_socks_addr` / `tor_control_addr` / `tor_cookie_path` / `tor_binary`（单 daemon 模式）。
+
+### 多 Tor 实例：per-Agent 独立出口
+
+单个 daemon 的问题不是匿名性，而是**换电路是进程级**的：一个 Agent 想换 IP，会把所有 Agent 的电路一起换掉。实例池让每个 Agent 落在自己的 daemon 上。
+
+- 「系统设置」页的「Tor 出口」（单 daemon + `严格模式（fail-closed）`）与「Tor 实例池（每 Agent 独立出口）」两个区块，对应设置项：`tor_pool_enabled`、`tor_pool_size`（1–32）、`tor_pool_socks_base`、`tor_pool_control_base`、`tor_pool_dir`、`tor_pool_upstream`。
+- slot N 的端口 = `base + N - 1`；Agent 通过**稳定哈希**固定到某个 slot（`agents.egress_tor_instance`，1-based；`0` = 回落到单 daemon）。
+- 启动**全有或全无**：任一 slot 起不来就整池失败，不留「一半在 Tor 上」的状态。
+- 就绪判定用控制口 `GETINFO status/bootstrap-phase` 要求 `PROGRESS=100`——**TCP 能连 ≠ 已可用**，这是实测踩出来的。
+- 重启后通过 `GETINFO config-file` 认领自己上一轮遗留的 daemon（cookie 不能先删，它就是认领凭证），端口冲突不再把启动打挂。
+- `tor_pool_upstream` 可给 daemon 自身挂上游 HTTP 代理（`host:port`），用于出口网络本身被封的环境。
+
+| 控制面接口 | 说明 |
+| --- | --- |
+| `GET /api/system/torpool` | 池状态（各 slot 端口 / bootstrap 进度 / 健康字段） |
+| `POST /api/system/torpool/start` · `/stop` | 起停整池 |
+| `PUT /api/system/torpool` | 保存池配置 |
+
+### Agent 级出口配置与审计
+
+「Agent 管理 → 出口」页签：出口策略（`direct` / `proxy` / `tor`）、Tor 出口国家偏好、固定实例、**出口实测**（拉最近几次 run 直接显示 `is_tor` 真/假）、**换电路**按钮（UI 明确提示：共享 daemon 时换电路是全局的）。严格模式（`egress_strict`）在这里是只读告警：开启且当前没有可用匿名出口时，页签内会直接提示所有触达目标的工具都将被拒绝。
+
+每次 run 的解析结果落在 `agent_egress_runs`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mode` / `proxy` | 实际出口；代理凭据在审计里按 `***@` 脱敏 |
+| `is_tor` | 是否 Tor 出口 |
+| `tor_instance` | 命中的池 slot；`0` = 共享 daemon |
+| `circuit` | 电路隔离键（SOCKS 用户名，只影响 circuit，不是口令） |
+
+> runtime 里的 slot 名（如 `work#3`）在审计前会归一化成 `worker`，否则同一 Agent 会因 key 漂移出现「refused」假阳性。
+
+### 「配了 Tor 却还是真实 IP」——已修的四个坑
+
+都是实测中被外部观测点的日志抓出来的，不是推测：
+
+1. **`getenv` 取第一个匹配**：旧实现用 `append(os.Environ(), extra...)` 注入代理，环境里已有同名变量时新值永远不生效 → 改为覆盖语义（`norma/tool` 的 `withEnv`）。
+2. **宿主 `~/.curlrc` 压过所有环境变量**：rc 文件里的 `proxy = http://...` 会让 `HTTP_PROXY` 全部失效 → 每次出口生成**独立的** `CURL_HOME/.curlrc` 与 `WGETRC/.wgetrc`；直连出口写 `noproxy = "*"`，避免 rc 把「直连」偷偷改成走代理。
+3. **`socks5://` 会本地解析域名**：既把目标域名泄漏给本地 DNS，也让 `.onion` 根本解析不了 → 统一改写为 `socks5h://`（远程 DNS）。
+4. **proxychains 类包装器**：PATH 里的 `proxy-guard-run.sh` 一类 shim 由包装器自己决定代理，环境变量管不住 → 启动时扫描并告警（实测命中 42 个）。
+
+### Onion 入站（反连 / 回调）
+
+「系统 → 入站通道」管理 v3 隐藏服务：新建服务、查看 `.onion` 地址、按客户端授权（x25519 密钥对，可单独吊销）、启停。torrc 片段的关键是 `HiddenServiceVersion 3` 与 `HiddenServicePort <虚拟端口> <目标>`——旧实现只写端口，tor 会直接拒绝启动。
+
+接口：`GET/POST /api/inbound/onion`、`POST /api/inbound/onion/{name}/clients`、`DELETE /api/inbound/onion/{name}/clients/{client}`、`POST /api/inbound/onion/{name}/enable`。
+
+### 信标通道
+
+「系统 → 信标通道」配合独立客户端 `cmd/beacon-client`：操作侧下发命令、被控侧拉取并回执、可撤销。消息体端到端加解密（`beacon/crypto.go`），平台只当中继。
+
+接口：`/api/beacon/channels`（列表 / 创建 / 撤销）、`/api/beacon/channels/{channel}/commands`（入队 / 取件）、`/poll`、`/pull`、`/flush`。
+
+### 验证方法（怎么证明「真的在走 Tor」）
+
+```bash
+# 1) 实例池单测 + 真实 Tor 端到端（需要本机 tor）
+go test ./torpool/
+go test -tags e2e ./torpool/ ./server/
+
+# 2) 完整回归（41 项断言，需要后端已启动并准备好 JWT）
+ARTEX_BASE=http://127.0.0.1:8899 ARTEX_TOKEN_FILE=/tmp/token.txt ./test/regression/tor_features.sh
+```
+
+用自己的可控观测点（自建回显服务、dnslog、httpworkbench 实例等）交叉验证时：
+
+- **只信 HTTP 台账**：`type=http` 那批的源 IP 必须全部落在 [Tor 出口列表](https://check.torproject.org/torbulkexitlist) 内。
+- `type=dns` 行的 `address` 是**解析器**而不是客户端：出口自己解析就是出口 IP；出口把递归转给 Cloudflare / Google 时就是那家递归器的地址。它无法反推你的真实 IP，同样也不能当作泄漏证据。
+- 判定「有没有泄漏」的硬指标只有一条：本机出口 IP（对照 Clash / 系统代理的出口地址）**一次都不该出现**。
+
+> 设计细节、缺陷复盘与测试计划见 [docs/TOR-AGENT-EGRESS-DESIGN.md](docs/TOR-AGENT-EGRESS-DESIGN.md)。
+
+---
 
 ## 开发
 
@@ -282,6 +382,7 @@ server {
 - 后端：`go run ./cmd/artex`（不带 `-tags embedui` 则不内嵌前端）
 - 前端：`cd web && npm run dev`（`/api` 反代到后端，带热更新）
 - 测试：`go test ./...`
+- Tor 端到端（需要本机 `tor`）：`go test -tags e2e ./torpool/ ./server/`；完整回归见 [验证方法](#验证方法怎么证明真的在走-tor)
 - Mock 预览（无后端）：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev`
 - 在线 Demo 重新部署（Cloudflare Pages，静态导出 + Mock 数据）：
   ```bash
@@ -339,6 +440,7 @@ flowchart TB
   end
   subgraph SUB["支撑子系统"]
     PROXY["流量记录代理　MITM + CA 留痕"]
+    EGRESS["出口编排　egress / torpool　按 Agent 选路 + 审计"]
     GUARD["guard / intercept　工具审批门"]
     ENR["enrich　DNS / HTTP 异步补全"]
     EXT["MCP · skills · memory · report"]
@@ -355,6 +457,9 @@ flowchart TB
   MA --> DB
   GO --> DB
   WK -->|"Bash / HTTP 全程留痕"| PROXY
+  PROXY -->|"解析后的出口"| EGRESS
+  EGRESS -->|"Tor / 代理 / 直连"| NET["目标 · 情报 API"]
+  WK -->|"出口策略校验"| EGRESS
   WK --> GUARD
   WK --> ENR
   PL -.-> EXT
@@ -369,6 +474,7 @@ flowchart TB
 | **engine** | 每任务一个 `plannerLoop` + N 个 worker goroutine；意图领取、超时/暂停/drain |
 | **agent** | goals / planner / worker / mainagent，`ToolSet` 把双图暴露成 LLM 工具 |
 | **db** | 双图的 Postgres 落地（pgx）；schema 随 `go:embed` 每次启动幂等建表 |
+| **出口** | `egress` 按流量类别解析出口（Tor 池 / 全局代理 / 直连），`torpool` 管理多 daemon，结果落 `agent_egress_runs` 审计 |
 | **支撑** | 记录型 MITM 代理、审批门、异步补全、MCP/技能/记忆/报告 |
 
 ### 双图架构：探索图 + 资产图
