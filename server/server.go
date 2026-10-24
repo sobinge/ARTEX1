@@ -165,6 +165,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		b := s.agentsForTask(t)
 		return b.pl, b.wk
 	})
+	// Per-work egress audit (Tor transparency): one row per work run, closed with
+	// the observed exit IP.
+	s.engine.SetEgressAudit(func(taskID, agentKey string) func(error) {
+		return s.beginEgressAudit(taskID, agentKey)
+	})
 	// Global readiness (Ready()/llm_configured): a global active LLM provider is
 	// installed. Task-level runnability is separate (ReadyFor → the resolver above).
 	s.engine.SetReadiness(func() bool {
@@ -471,6 +476,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
 	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	s.chatAgent.SetEgressResolver(s.egressBinding)
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
 	s.chatAgent.SetGuard(s.chatGuard())
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
@@ -612,6 +618,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
 	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	ca.SetEgressResolver(s.egressBinding)
 	ca.SetWebSearch(s.m.WebSearchOpts())
 	ca.SetGuard(s.chatGuard())
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
@@ -853,6 +860,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/agents/{key}/prompt/preview", s.pgPreviewPrompt)
 	mux.HandleFunc("GET /api/agents/{key}/visibility", s.pgGetAgentVisibility)
 	mux.HandleFunc("PUT /api/agents/{key}/visibility", s.pgSetAgentVisibility)
+	// Tor 出口(Agent 级):查看生效出口、实测出口 IP、换电路、审计记录。
+	mux.HandleFunc("GET /api/agents/{key}/egress", s.getAgentEgress)
+	mux.HandleFunc("POST /api/agents/{key}/egress/test", s.testAgentEgress)
+	mux.HandleFunc("POST /api/agents/{key}/egress/newnym", s.newNym)
+	mux.HandleFunc("GET /api/agents/{key}/egress/runs", s.listAgentEgressRuns)
+	// Tor 实例池：多 Daemon 编排，让换电路只影响单个 agent
+	mux.HandleFunc("GET /api/system/torpool", s.getTorPool)
+	mux.HandleFunc("POST /api/system/torpool/start", s.startTorPool)
+	mux.HandleFunc("POST /api/system/torpool/stop", s.stopTorPool)
+	mux.HandleFunc("PUT /api/system/torpool", s.updateTorPool)
+	// 入站通道：Onion Service + 客户端授权（不允许裸 Onion）
+	mux.HandleFunc("GET /api/inbound/onion", s.listOnionServices)
+	mux.HandleFunc("POST /api/inbound/onion", s.createOnionService)
+	mux.HandleFunc("POST /api/inbound/onion/{name}/clients", s.addOnionClient)
+	mux.HandleFunc("DELETE /api/inbound/onion/{name}/clients/{client}", s.revokeOnionClient)
+	mux.HandleFunc("POST /api/inbound/onion/{name}/enable", s.enableOnionService)
+	// 信标通道(dead-drop)：双方都只做出站，操作端轮询强制经匿名出口。
+	mux.HandleFunc("GET /api/beacon/channels", s.listBeaconChannels)
+	mux.HandleFunc("POST /api/beacon/channels", s.createBeaconChannel)
+	mux.HandleFunc("POST /api/beacon/channels/{channel}/commands", s.enqueueBeaconCommand)
+	mux.HandleFunc("GET /api/beacon/channels/{channel}/commands", s.takeBeaconCommands)
+	mux.HandleFunc("GET /api/beacon/channels/{channel}/poll", s.operatorPoll)
+	mux.HandleFunc("POST /api/beacon/channels/{channel}/revoke", s.revokeBeaconChannel)
+	// 信箱传输：把指令推到信箱 / 从信箱拉取结果（均强制匿名出口）
+	mux.HandleFunc("POST /api/beacon/channels/{channel}/flush", s.flushBeaconOutbox)
+	mux.HandleFunc("POST /api/beacon/channels/{channel}/pull", s.pullBeaconInbox)
 	// 内置工具目录（描述/参数默认值可改、按 agent 绑定；key 与 handler 在代码层）
 	mux.HandleFunc("GET /api/tools", s.pgListTools)
 	mux.HandleFunc("PUT /api/tools/{key}", s.pgUpdateTool)
@@ -3289,16 +3322,31 @@ func (s *Server) settingsPayload() map[string]any {
 	if concLimit == 0 {
 		concLimit = defaultConcurrencyLimit // 关闭时也回显一个合理默认值给 UI
 	}
+	torSocksBase, torControlBase := s.m.TorPoolPorts()
 	return map[string]any{
-		"traffic_capture":          s.m.TrafficEnabled(),
-		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
-		"llm_record":               s.m.LLMRecordEnabled(),
-		"web_search_enabled":       on,
-		"web_search_backend":       backend,
-		"brave_key_set":            strings.TrimSpace(braveKey) != "",
-		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"traffic_capture":       s.m.TrafficEnabled(),
+		"agent_traffic_binding": s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"llm_record":            s.m.LLMRecordEnabled(),
+		"web_search_enabled":    on,
+		"web_search_backend":    backend,
+		"brave_key_set":         strings.TrimSpace(braveKey) != "",
+		"tavily_key_set":        strings.TrimSpace(tavilyKey) != "",
+		"web_search_proxy":      proxy,                // 独立出口代理(http/https/socks5)，空=直连
+		"global_proxy":          s.m.GlobalProxy(),    // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"egress_strict":         s.m.EgressStrict(),   // fail-closed：无匿名出口时拒绝目标流量，不回退直连
+		"tor_socks_addr":        s.m.TorSocksAddr(),   // egress_mode=tor 使用的 Tor SOCKS 地址(socks5h://...)
+		"tor_control_addr":      s.m.TorControlAddr(), // Tor 控制口(换电路用)，空=禁用
+		"tor_cookie_path":       s.m.TorCookiePath(),  // 控制口认证 cookie 路径
+		// Tor 实例池（每 Agent 独立出口）
+		"tor_pool_enabled":         s.m.TorPoolEnabled(),
+		"tor_pool_status":          s.m.TorPoolStatus(),
+		"tor_pool_size":            s.m.TorPoolSize(),
+		"tor_pool_dir":             s.m.TorPoolStatus().Dir,
+		"tor_binary":               s.m.TorPoolStatus().Binary,
+		"tor_pool_upstream":        s.m.TorPoolUpstream(),
+		"tor_pool_socks_base":      torSocksBase,
+		"tor_pool_control_base":    torControlBase,
+		"tor_pool_ports":           s.m.TorPoolStatus().Ports,
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
@@ -3371,6 +3419,10 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		TavilyKey        *string `json:"tavily_search_api_key"`
 		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
 		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
+		EgressStrict     *bool   `json:"egress_strict"`      // fail-closed 开关；null=不改
+		TorSocksAddr     *string `json:"tor_socks_addr"`     // Tor SOCKS 地址；null=不改，""=清空
+		TorControlAddr   *string `json:"tor_control_addr"`   // Tor 控制口；null=不改，""=清空
+		TorCookiePath    *string `json:"tor_cookie_path"`    // 控制口 cookie 路径；null=不改
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
 		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
@@ -3524,6 +3576,33 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		changed = true // capture-off egress is baked into agents at build time → rebuild
+	}
+	if req.TorSocksAddr != nil {
+		if err := s.m.SetTorSocksAddr(*req.TorSocksAddr); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		changed = true
+	}
+	if req.TorControlAddr != nil || req.TorCookiePath != nil {
+		addr, cookie := s.m.TorControlAddr(), s.m.TorCookiePath()
+		if req.TorControlAddr != nil {
+			addr = strings.TrimSpace(*req.TorControlAddr)
+		}
+		if req.TorCookiePath != nil {
+			cookie = strings.TrimSpace(*req.TorCookiePath)
+		}
+		if err := s.m.SetTorControl(addr, cookie); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.EgressStrict != nil {
+		if err := s.m.SetEgressStrict(*req.EgressStrict); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		changed = true
 	}
 	if req.WebSearchEnabled != nil || req.WebSearchBackend != nil || req.BraveKey != nil || req.TavilyKey != nil || req.WebSearchProxy != nil {
 		// Fill unspecified fields from current state so a partial PUT doesn't reset them.

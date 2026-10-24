@@ -382,3 +382,46 @@ func TestBashEnvInjection(t *testing.T) {
 		t.Fatalf("env not injected/overridden: %q", out)
 	}
 }
+
+// TestBashEnvOverridesInheritedProxy is the regression for a silent Tor bypass:
+// the platform process itself exports HTTPS_PROXY=<global proxy>, so appending
+// the agent's Tor proxy left the global one in effect (getenv returns the first
+// match) and every curl in the task dialed the global proxy instead of Tor.
+func TestBashEnvOverridesInheritedProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+	t.Setenv("https_proxy", "http://127.0.0.1:7897")
+
+	env := withEnv([]string{"HTTPS_PROXY=socks5h://127.0.0.1:19751", "https_proxy=socks5h://127.0.0.1:19751"})
+	if env == nil {
+		t.Fatal("withEnv returned nil")
+	}
+	var https, lower []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "HTTPS_PROXY=") {
+			https = append(https, kv)
+		}
+		if strings.HasPrefix(kv, "https_proxy=") {
+			lower = append(lower, kv)
+		}
+	}
+	if len(https) != 1 || https[0] != "HTTPS_PROXY=socks5h://127.0.0.1:19751" {
+		t.Fatalf("HTTPS_PROXY entries = %v (duplicate/leftover inherited value)", https)
+	}
+	if len(lower) != 1 || lower[0] != "https_proxy=socks5h://127.0.0.1:19751" {
+		t.Fatalf("https_proxy entries = %v", lower)
+	}
+}
+
+func TestWithEnvKeepsUnrelatedVars(t *testing.T) {
+	t.Setenv("ARTEX_UNRELATED_KEEP", "1")
+	env := withEnv([]string{"HTTPS_PROXY=socks5h://p:1"})
+	found := false
+	for _, kv := range env {
+		if kv == "ARTEX_UNRELATED_KEEP=1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("unrelated inherited variable was dropped")
+	}
+}

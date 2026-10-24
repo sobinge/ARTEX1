@@ -549,6 +549,13 @@ type AgentDTO struct {
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
+	// 出口策略（Tor）。缺了这几项，Agent 编辑器「出口」页永远显示默认值。
+	EgressMode        string `json:"egress_mode"`
+	EgressProxy       string `json:"egress_proxy,omitempty"`
+	TorExitCountry    string `json:"tor_exit_country,omitempty"`
+	TorRotate         string `json:"tor_rotate"`
+	TorCircuitKey     string `json:"tor_circuit_key"`
+	EgressTorInstance int    `json:"egress_tor_instance"`
 	// binding counts (populated only by the list endpoint) — shown on agent cards.
 	McpCount   int `json:"mcp_count"`
 	SkillCount int `json:"skill_count"`
@@ -572,6 +579,12 @@ func agentDTO(a *db.Agent) AgentDTO {
 		TriggerRunMode:     a.TriggerRunMode,
 		TriggerMergeMode:   a.TriggerMergeMode,
 		TriggerMaxParallel: a.TriggerMaxParallel,
+		EgressMode:         a.EgressMode,
+		EgressProxy:        a.EgressProxy,
+		TorExitCountry:     a.TorExitCountry,
+		TorRotate:          a.TorRotate,
+		TorCircuitKey:      a.TorCircuitKey,
+		EgressTorInstance:  a.EgressTorInstance,
 	}
 }
 

@@ -1,27 +1,4 @@
-import {
-  Activity,
-  Ban,
-  BellRing,
-  Bot,
-  Brain,
-  Bug,
-  ClipboardList,
-  FolderOpen,
-  FolderSync,
-  LayoutDashboard,
-  type LucideIcon,
-  MessageSquare,
-  Network,
-  Plug,
-  Radio,
-  ScrollText,
-  Settings2,
-  ShieldAlert,
-  Sparkles,
-  Target,
-  Terminal,
-  Wrench,
-} from "lucide-react";
+import { Activity, Ban, BellRing, Bot, Brain, Bug, ClipboardList, FolderOpen, FolderSync, LayoutDashboard, MessageSquare, Network, Plug, Radio, RadioTower, ScrollText, Settings2, ShieldAlert, Sparkles, Target, Terminal, Wrench, type LucideIcon } from "lucide-react";
 
 export type NavBadge = "new" | "soon";
 
@@ -92,6 +69,8 @@ export const sidebarItems: NavGroup[] = [
       { id: "asset-intercept", title: "资产拦截", url: "/system/intercept/assets", icon: Ban },
       { id: "approvals", title: "审批记录", url: "/system/intercept/approvals", icon: ClipboardList },
       { id: "logs", title: "日志", url: "/system/logs", icon: ScrollText },
+      { id: "inbound", title: "入站通道", url: "/system/inbound", icon: RadioTower },
+      { id: "beacon", title: "信标通道", url: "/system/beacon", icon: Radio },
       { id: "settings", title: "系统配置", url: "/system/settings", icon: Settings2 },
     ],
   },

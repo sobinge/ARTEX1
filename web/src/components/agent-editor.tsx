@@ -68,6 +68,18 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const [ttTurns, setTtTurns] = React.useState("0");
   const [ttTurnsDefault, setTtTurnsDefault] = React.useState(5);
   const [settings, setSettings] = React.useState<Settings | null>(null);
+  // 出口策略（Tor）
+  const [egressMode, setEgressMode] = React.useState<"inherit" | "direct" | "proxy" | "tor">("inherit");
+  const [egressProxy, setEgressProxy] = React.useState("");
+  const [torCountry, setTorCountry] = React.useState("");
+  const [torRotate, setTorRotate] = React.useState<"off" | "per_run" | "per_intent" | "per_task">("off");
+  const [torCircuit, setTorCircuit] = React.useState<"task" | "agent" | "off">("task");
+  // 多 Tor 实例：0 = 自动（按 agent key 哈希），>0 = 固定实例
+  const [torInstance, setTorInstance] = React.useState(0);
+  const [torPoolSize, setTorPoolSize] = React.useState(0);
+  const [egressProbe, setEgressProbe] = React.useState<import("@/lib/types").EgressProbe | null>(null);
+  const [egressRuns, setEgressRuns] = React.useState<import("@/lib/types").EgressRun[]>([]);
+  const [egressBusy, setEgressBusy] = React.useState(false);
 
   React.useEffect(() => {
     api.mcpServers().then(setMcp).catch(() => {});
@@ -104,6 +116,13 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
         setTtWrapupDefault(d.task_timeout_wrapup_default ?? "");
         setTtTurns(String(d.task_timeout_wrapup_max_turns ?? 0));
         setTtTurnsDefault(d.task_timeout_wrapup_max_turns_default ?? 5);
+        const ag = d.agent;
+        setEgressMode((ag?.egress_mode as typeof egressMode) ?? "inherit");
+        setEgressProxy(ag?.egress_proxy ?? "");
+        setTorCountry(ag?.tor_exit_country ?? "");
+        setTorRotate((ag?.tor_rotate as typeof torRotate) ?? "off");
+        setTorCircuit((ag?.tor_circuit_key as typeof torCircuit) ?? "task");
+        setTorInstance(ag?.egress_tor_instance ?? 0);
       })
       .catch(() => setDetail(null))
       .finally(() => setLoaded(true));
@@ -111,6 +130,20 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   React.useEffect(() => {
     reload();
   }, [reload]);
+  // Tor 实例池规模：决定「出口」页实例下拉的取值范围。
+  React.useEffect(() => {
+    api
+      .torPool()
+      .then((r) => setTorPoolSize(r.status?.size ?? 0))
+      .catch(() => setTorPoolSize(0));
+  }, [agentKey]);
+  // 出口审计：进入编辑器即拉一次，避免用户切到「出口」页看到空白。
+  React.useEffect(() => {
+    api
+      .agentEgressRuns(agentKey)
+      .then((r) => setEgressRuns(r.runs ?? []))
+      .catch(() => {});
+  }, [agentKey]);
 
   async function doPreview() {
     try {
@@ -196,6 +229,47 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
       toast.error("保存失败：" + (e as Error).message);
     }
   }
+  async function saveEgress() {
+    try {
+      await api.saveAgentConfig(agentKey, {
+        egress_mode: egressMode,
+        egress_proxy: egressProxy.trim(),
+        tor_exit_country: torCountry.trim(),
+        tor_rotate: torRotate,
+        tor_circuit_key: torCircuit,
+        egress_tor_instance: torInstance,
+      });
+      toast.success("已保存出口策略");
+      reload();
+    } catch (e) {
+      toast.error(`保存失败：${(e as Error).message}`);
+    }
+  }
+  async function testEgress() {
+    setEgressBusy(true);
+    setEgressProbe(null);
+    try {
+      const r = await api.testAgentEgress(agentKey);
+      if (r.probe) setEgressProbe(r.probe);
+      if (!r.ok) toast.error(r.error ?? r.probe?.error ?? "出口不可用");
+      else toast.success("出口可用");
+    } catch (e) {
+      toast.error(`测试失败：${(e as Error).message}`);
+    } finally {
+      setEgressBusy(false);
+    }
+  }
+  async function rotateCircuit() {
+    setEgressBusy(true);
+    try {
+      await api.agentEgressNewNym(agentKey);
+      toast.success("已发送换电路指令（Tor 为进程级，影响同一 daemon 上的所有 Agent）");
+    } catch (e) {
+      toast.error(`换电路失败：${(e as Error).message}`);
+    } finally {
+      setEgressBusy(false);
+    }
+  }
   // applyVis optimistically updates, persists, and toasts success/failure. On
   // failure it reverts to the prior selection so the UI never lies about state.
   async function applyVis(nextMcp: number[], nextSkill: string[], okMsg: string) {
@@ -275,6 +349,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
         <TabsTrigger value="mcp">MCP</TabsTrigger>
         <TabsTrigger value="skill">Skill</TabsTrigger>
         <TabsTrigger value="tools">Tools</TabsTrigger>
+        <TabsTrigger value="egress">出口</TabsTrigger>
         {isCustom && <TabsTrigger value="triggers">触发</TabsTrigger>}
       </TabsList>
 
@@ -591,6 +666,162 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
       </TabsContent>
 
       {/* MCP 可见性 */}
+      <TabsContent value="egress" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
+        <div className="grid gap-4 py-3">
+          {settings?.egress_strict !== false && egressMode === "inherit" && !settings?.tor_socks_addr && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+              <b>严格模式已开启（fail-closed）</b>：当前没有配置匿名出口，所有触达目标的工具都会被拒绝执行，
+              不会回退直连。请在「系统配置」填写 Tor SOCKS 地址，或在此为 Agent 选择 Tor / 代理。
+            </div>
+          )}
+
+          <div className="grid gap-3 rounded-md border p-3">
+            <div className="grid gap-1.5">
+              <Label className="text-xs">出口策略</Label>
+              <Select value={egressMode} onValueChange={(v) => setEgressMode(v as typeof egressMode)}>
+                <SelectTrigger className="h-8 w-72"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">跟随系统默认出口</SelectItem>
+                  <SelectItem value="direct">直连（严格模式下会被拒绝）</SelectItem>
+                  <SelectItem value="proxy">指定代理</SelectItem>
+                  <SelectItem value="tor">Tor（远程 DNS · 电路隔离）</SelectItem>
+                </SelectContent>
+              </Select>
+              <span className="text-muted-foreground text-xs">
+                目标流量一律不得暴露真实 IP。fail-closed 开启时，匿名出口不可用会中止执行而不是回退直连。
+              </span>
+            </div>
+
+            {egressMode === "proxy" && (
+              <div className="grid gap-1.5">
+                <Label htmlFor="egress-proxy" className="text-xs">代理地址</Label>
+                <Input id="egress-proxy" className="h-8 font-mono text-xs" placeholder="socks5h://user:pass@host:1080 或 http://host:port"
+                  value={egressProxy} onChange={(e) => setEgressProxy(e.target.value)} />
+                <span className="text-muted-foreground text-xs">socks5h 让代理解析域名；socks5 会本地解析（.onion 不可用且泄露 DNS）。</span>
+              </div>
+            )}
+
+            {egressMode === "tor" && (
+              <div className="flex flex-wrap items-end gap-3">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="tor-country" className="text-xs">出口国家</Label>
+                  <Input id="tor-country" className="h-8 w-24 font-mono" placeholder="sg" maxLength={2}
+                    value={torCountry} onChange={(e) => setTorCountry(e.target.value.toLowerCase())} />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">电路隔离粒度</Label>
+                  <Select value={torCircuit} onValueChange={(v) => setTorCircuit(v as typeof torCircuit)}>
+                    <SelectTrigger className="h-8 w-40"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="task">按任务（task-&lt;id&gt;）</SelectItem>
+                      <SelectItem value="agent">按 Agent（agent-&lt;key&gt;）</SelectItem>
+                      <SelectItem value="off">不隔离</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">轮换时机</Label>
+                  <Select value={torRotate} onValueChange={(v) => setTorRotate(v as typeof torRotate)}>
+                    <SelectTrigger className="h-8 w-40"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="off">不自动轮换</SelectItem>
+                      <SelectItem value="per_run">每次运行</SelectItem>
+                      <SelectItem value="per_intent">每条意图</SelectItem>
+                      <SelectItem value="per_task">每个任务</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Tor 实例</Label>
+                  <Select value={String(torInstance)} onValueChange={(v) => setTorInstance(Number(v))}>
+                    <SelectTrigger className="h-8 w-40"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="0">自动（按 Agent 哈希）</SelectItem>
+                      {Array.from({ length: torPoolSize }, (_, i) => (
+                        <SelectItem key={i + 1} value={String(i + 1)}>实例 {i + 1}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <span className="text-muted-foreground text-xs">
+                    {torPoolSize > 0
+                      ? "固定实例后，换电路只影响本 Agent。"
+                      : "未启用实例池：所有 Agent 共用一个 daemon，换电路是全局的。"}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" variant="outline" onClick={saveEgress}>
+                <SaveIcon /> 保存出口
+              </Button>
+              <Button size="sm" variant="outline" disabled={egressBusy} onClick={testEgress}>
+                测试连接
+              </Button>
+              {egressMode === "tor" && (
+                <Button size="sm" variant="outline" disabled={egressBusy} onClick={rotateCircuit}>
+                  立即换电路
+                </Button>
+              )}
+            </div>
+
+            {egressProbe && (
+              <div className="grid gap-1 rounded-md bg-muted/40 p-2 text-xs">
+                {egressProbe.error ? (
+                  <span className="text-destructive">出口不可用：{egressProbe.error}</span>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Badge variant={egressProbe.is_tor ? "default" : "secondary"}>
+                      {egressProbe.is_tor ? "Tor" : "非 Tor"}
+                    </Badge>
+                    <span className="font-mono">{egressProbe.ip}</span>
+                    <span>{egressProbe.country || "未知地区"}</span>
+                    <span className="text-muted-foreground">{egressProbe.latency_ms} ms</span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="grid gap-2">
+            <div className="flex items-center justify-between">
+              <Label className="text-xs">出口审计（最近 100 条）</Label>
+              <Button size="sm" variant="ghost" onClick={() => api.agentEgressRuns(agentKey).then((r) => setEgressRuns(r.runs ?? [])).catch(() => {})}>
+                刷新
+              </Button>
+            </div>
+            {egressRuns.length === 0 ? (
+              <span className="text-muted-foreground text-xs">暂无记录。每次 Agent 运行会记录出口模式与实测出口 IP。</span>
+            ) : (
+              <div className="overflow-hidden rounded-md border">
+                <table className="w-full text-xs">
+                  <thead className="bg-muted/50 text-left">
+                    <tr>
+                      <th className="p-2">时间</th>
+                      <th className="p-2">模式</th>
+                      <th className="p-2">出口 IP</th>
+                      <th className="p-2">电路</th>
+                      <th className="p-2">任务</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {egressRuns.map((r) => (
+                      <tr key={r.id} className="border-t">
+                        <td className="p-2 font-mono">{new Date(r.started_at).toLocaleString()}</td>
+                        <td className="p-2">{r.mode}{r.is_tor ? " · Tor" : ""}</td>
+                        <td className="p-2 font-mono">{r.exit_ip || "—"}</td>
+                        <td className="p-2 font-mono">{r.circuit_user || "—"}</td>
+                        <td className="p-2 font-mono">{r.task_id ?? "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      </TabsContent>
+
       <TabsContent value="mcp" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         <p className="text-muted-foreground mb-3 text-xs">勾选此 Agent 可见的 MCP 服务器。</p>
         <div className="grid gap-2">

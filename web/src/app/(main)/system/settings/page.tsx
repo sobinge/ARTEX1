@@ -10,10 +10,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
 import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSendMode } from "@/lib/chat-send-mode";
-import type { Settings } from "@/lib/types";
+import type { Settings, TorPoolStatus } from "@/lib/types";
 
 import { UpdateCard } from "./_components/update-card";
 
@@ -30,6 +31,22 @@ export default function SystemSettingsPage() {
   const [proxyInput, setProxyInput] = React.useState("");
   const [savingProxy, setSavingProxy] = React.useState(false);
   const [globalProxyInput, setGlobalProxyInput] = React.useState("");
+  // Tor 出口（Agent 级出口策略的兜底配置）
+  const [egressStrict, setEgressStrict] = React.useState(true);
+  const [torSocksAddr, setTorSocksAddr] = React.useState("");
+  const [torControlAddr, setTorControlAddr] = React.useState("");
+  const [torCookiePath, setTorCookiePath] = React.useState("");
+  const [savingTor, setSavingTor] = React.useState(false);
+  // Tor 实例池（每 Agent 独立出口）
+  const [poolEnabled, setPoolEnabled] = React.useState(false);
+  const [poolSize, setPoolSize] = React.useState("3");
+  const [poolSocksBase, setPoolSocksBase] = React.useState("19050");
+  const [poolControlBase, setPoolControlBase] = React.useState("19150");
+  const [poolDir, setPoolDir] = React.useState("");
+  const [poolBinary, setPoolBinary] = React.useState("tor");
+  const [poolUpstream, setPoolUpstream] = React.useState("");
+  const [poolStatus, setPoolStatus] = React.useState<TorPoolStatus | null>(null);
+  const [savingPool, setSavingPool] = React.useState(false);
   const [savingGlobalProxy, setSavingGlobalProxy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
@@ -55,6 +72,20 @@ export default function SystemSettingsPage() {
     setTavilyKeySet(!!s.tavily_key_set);
     setProxyInput(s.web_search_proxy ?? "");
     setGlobalProxyInput(s.global_proxy ?? "");
+    setEgressStrict(s.egress_strict !== false);
+    setTorSocksAddr(s.tor_socks_addr ?? "");
+    setTorControlAddr(s.tor_control_addr ?? "");
+    setTorCookiePath(s.tor_cookie_path ?? "");
+    setPoolEnabled(!!s.tor_pool_enabled);
+    setPoolUpstream(s.tor_pool_upstream ?? "");
+    if (s.tor_pool_socks_base) setPoolSocksBase(String(s.tor_pool_socks_base));
+    if (s.tor_pool_control_base) setPoolControlBase(String(s.tor_pool_control_base));
+    if (s.tor_pool_status) {
+      setPoolStatus(s.tor_pool_status);
+      setPoolSize(String(s.tor_pool_size || s.tor_pool_status.size || 3));
+      setPoolDir(s.tor_pool_status.dir ?? "");
+      setPoolBinary(s.tor_pool_status.binary ?? "tor");
+    }
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
     setInjectPlanner(s.constraints_inject_planner !== false);
@@ -232,6 +263,54 @@ export default function SystemSettingsPage() {
       .finally(() => setSavingGlobalProxy(false));
   };
 
+  const saveTor = () => {
+    setSavingTor(true);
+    api
+      .setSettings({
+        egress_strict: egressStrict,
+        tor_socks_addr: torSocksAddr.trim(),
+        tor_control_addr: torControlAddr.trim(),
+        tor_cookie_path: torCookiePath.trim(),
+      })
+      .then((s) => {
+        apply(s);
+        toast.success(egressStrict ? "已保存 Tor 出口（严格模式：无匿名出口时拒绝目标流量）" : "已保存 Tor 出口（严格模式已关闭）");
+      })
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
+      .finally(() => setSavingTor(false));
+  };
+
+  const savePool = () => {
+    setSavingPool(true);
+    api
+      .torPoolUpdate({
+        enabled: poolEnabled,
+        size: Number(poolSize) || 3,
+        socks_base: Number(poolSocksBase) || 19050,
+        control_base: Number(poolControlBase) || 19150,
+        dir: poolDir.trim(),
+        binary: poolBinary.trim() || "tor",
+        upstream: poolUpstream.trim(),
+      })
+      .then((r) => {
+        setPoolStatus(r.status);
+        toast.success(r.status.started ? `实例池已启动（${r.status.size} 个实例）` : "实例池配置已保存（未启用）");
+      })
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
+      .finally(() => setSavingPool(false));
+  };
+
+  const poolAction = (action: "start" | "stop") => {
+    setSavingPool(true);
+    (action === "start" ? api.torPoolStart() : api.torPoolStop())
+      .then((r) => {
+        setPoolStatus(r.status);
+        toast.success(action === "start" ? "实例池已启动" : "实例池已停止");
+      })
+      .catch((e) => toast.error(`${action === "start" ? "启动" : "停止"}失败：${(e as Error).message}`))
+      .finally(() => setSavingPool(false));
+  };
+
   // Run a real "test" search ("test") against the CURRENT form values (backend +
   // proxy + entered key), falling back to saved values server-side. Toasts result.
   const runTest = () => {
@@ -361,6 +440,174 @@ export default function SystemSettingsPage() {
             <p className="text-muted-foreground text-xs">
               {globalProxyInput.trim() ? "已配置 · 所有目标流量经此代理出网" : "未配置 · 目标流量直连出网"}
             </p>
+
+            <Separator className="my-3" />
+
+            <div className="flex items-center justify-between gap-4">
+              <div className="grid gap-0.5">
+                <Label htmlFor="egress-strict" className="text-sm">严格模式（fail-closed）</Label>
+                <span className="text-muted-foreground text-xs">
+                  开启后，目标流量必须有匿名出口；匿名出口不可用会<b>中止执行</b>，绝不回退直连。
+                </span>
+              </div>
+              <Switch
+                id="egress-strict"
+                checked={egressStrict}
+                disabled={!loaded || savingTor}
+                onCheckedChange={setEgressStrict}
+              />
+            </div>
+
+            <div className="mt-2 grid gap-2">
+              <Label htmlFor="tor-socks" className="text-sm font-normal text-muted-foreground">
+                Tor SOCKS 地址（Agent 选择「Tor」时使用）
+              </Label>
+              <Input
+                id="tor-socks"
+                autoComplete="off"
+                className="font-mono text-xs"
+                placeholder="socks5h://127.0.0.1:9050（留空=回落到上面的全局代理）"
+                value={torSocksAddr}
+                disabled={!loaded || savingTor}
+                onChange={(e) => setTorSocksAddr(e.target.value)}
+              />
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div className="grid gap-2">
+                  <Label htmlFor="tor-ctl" className="text-xs font-normal text-muted-foreground">控制口（换电路）</Label>
+                  <Input
+                    id="tor-ctl"
+                    autoComplete="off"
+                    className="font-mono text-xs"
+                    placeholder="127.0.0.1:9051"
+                    value={torControlAddr}
+                    disabled={!loaded || savingTor}
+                    onChange={(e) => setTorControlAddr(e.target.value)}
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="tor-cookie" className="text-xs font-normal text-muted-foreground">控制口 cookie 路径</Label>
+                  <Input
+                    id="tor-cookie"
+                    autoComplete="off"
+                    className="font-mono text-xs"
+                    placeholder="/var/lib/tor/control_auth_cookie"
+                    value={torCookiePath}
+                    disabled={!loaded || savingTor}
+                    onChange={(e) => setTorCookiePath(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button type="button" onClick={saveTor} disabled={!loaded || savingTor}>
+                  保存 Tor 配置
+                </Button>
+                <span className="text-muted-foreground text-xs">
+                  换电路是 Tor 进程级操作，会影响同一 daemon 上的所有 Agent。
+                </span>
+              </div>
+            </div>
+
+            <Separator className="my-3" />
+
+            <div className="grid gap-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <Label htmlFor="tor-pool" className="text-sm font-normal">Tor 实例池（每 Agent 独立出口）</Label>
+                  <p className="text-muted-foreground text-xs">
+                    启动 N 个独立 Tor daemon；每个 Agent 固定一个实例，换电路只影响该 Agent（SIGNAL NEWNYM 不再全局生效）。
+                  </p>
+                </div>
+                <Switch
+                  id="tor-pool"
+                  checked={poolEnabled}
+                  disabled={!loaded || savingPool}
+                  onCheckedChange={setPoolEnabled}
+                />
+              </div>
+
+              <div className="grid gap-2 sm:grid-cols-4">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="pool-size" className="text-xs font-normal text-muted-foreground">实例数</Label>
+                  <Input id="pool-size" className="font-mono text-xs" value={poolSize}
+                    disabled={!loaded || savingPool} onChange={(e) => setPoolSize(e.target.value)} />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="pool-socks" className="text-xs font-normal text-muted-foreground">SOCKS 起始端口</Label>
+                  <Input id="pool-socks" className="font-mono text-xs" value={poolSocksBase}
+                    disabled={!loaded || savingPool} onChange={(e) => setPoolSocksBase(e.target.value)} />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="pool-ctl" className="text-xs font-normal text-muted-foreground">控制口起始端口</Label>
+                  <Input id="pool-ctl" className="font-mono text-xs" value={poolControlBase}
+                    disabled={!loaded || savingPool} onChange={(e) => setPoolControlBase(e.target.value)} />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="pool-bin" className="text-xs font-normal text-muted-foreground">tor 可执行文件</Label>
+                  <Input id="pool-bin" className="font-mono text-xs" value={poolBinary}
+                    disabled={!loaded || savingPool} onChange={(e) => setPoolBinary(e.target.value)} />
+                </div>
+              </div>
+
+              <div className="grid gap-1.5">
+                <Label htmlFor="pool-upstream" className="text-xs font-normal text-muted-foreground">
+                  Tor 上游代理（可选，host:port）：直连 guard 被阻断时让 daemon 自身走 HTTP CONNECT 代理
+                </Label>
+                <Input id="pool-upstream" className="font-mono text-xs" placeholder="127.0.0.1:7897"
+                  value={poolUpstream} disabled={!loaded || savingPool} onChange={(e) => setPoolUpstream(e.target.value)} />
+              </div>
+
+              <div className="grid gap-1.5">
+                <Label htmlFor="pool-dir" className="text-xs font-normal text-muted-foreground">
+                  数据目录（每个实例一个子目录：torrc / DataDirectory / cookie）
+                </Label>
+                <Input id="pool-dir" className="font-mono text-xs" placeholder="<数据目录>/torpool"
+                  value={poolDir} disabled={!loaded || savingPool} onChange={(e) => setPoolDir(e.target.value)} />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <Button type="button" onClick={savePool} disabled={!loaded || savingPool}>
+                  保存并应用
+                </Button>
+                <Button type="button" variant="outline" onClick={() => poolAction("start")} disabled={!loaded || savingPool}>
+                  启动
+                </Button>
+                <Button type="button" variant="outline" onClick={() => poolAction("stop")} disabled={!loaded || savingPool}>
+                  停止
+                </Button>
+                <span className="text-muted-foreground text-xs">
+                  {poolStatus
+                    ? `${poolStatus.started ? "运行中" : "未运行"} · ${poolStatus.size} 个实例 · ${poolStatus.ports}`
+                    : "尚未读取实例池状态"}
+                </span>
+              </div>
+
+              {poolStatus && poolStatus.instances && poolStatus.instances.length > 0 && (
+                <div className="overflow-hidden rounded-md border">
+                  <table className="w-full text-xs">
+                    <thead className="bg-muted/40">
+                      <tr>
+                        <th className="p-2 text-left">实例</th>
+                        <th className="p-2 text-left">SOCKS</th>
+                        <th className="p-2 text-left">控制口</th>
+                        <th className="p-2 text-left">进程</th>
+                        <th className="p-2 text-left">Cookie</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {poolStatus.instances.map((it) => (
+                        <tr key={it.id} className="border-t">
+                          <td className="p-2 font-mono">{it.id}</td>
+                          <td className="p-2 font-mono">{it.socks_addr}</td>
+                          <td className="p-2 font-mono">{it.control_addr}</td>
+                          <td className="p-2">{it.running ? "运行" : "停止"}</td>
+                          <td className="p-2">{it.cookie_ready ? "就绪" : "缺失"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           </CardContent>
         </Card>
 

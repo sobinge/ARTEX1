@@ -34,7 +34,7 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	// full plannerSystem path: DB body [A] is honored, then the code-owned tail
 	// [C] (中间产物输出规约) is ALWAYS appended — editing the body can't drop it.
 	PromptOverride = func(k string) (string, bool) { return "PLANNER {{.Goal}}", true }
-	got := plannerSystem("拿下X", "/data", "/data")
+	got := plannerSystem("拿下X", "/data", "/data", false, "")
 	if !strings.HasPrefix(got, "PLANNER 拿下X") {
 		t.Fatalf("plannerSystem body not honored: %q", got)
 	}
@@ -50,7 +50,7 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	PromptOverride = func(k string) (string, bool) {
 		return "{{if .ProxyAddr}}走代理 {{.ProxyAddr}}{{else}}手动{{end}}", true
 	}
-	recording := workerSystem("127.0.0.1:8080", "/ca.pem", "/data", "/data")
+	recording := workerSystem("127.0.0.1:8080", "/ca.pem", "/data", "/data", false, "")
 	if !strings.HasPrefix(recording, "走代理 127.0.0.1:8080") {
 		t.Fatalf("worker proxy branch body: %q", recording)
 	}
@@ -65,18 +65,33 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	}
 	// Egress proxy set but capture OFF (no CA): the ProxyAddr template branch still
 	// renders, but the trafficTool block must NOT — those tools are not registered.
-	egressOnly := workerSystem("127.0.0.1:8080", "", "/data", "/data")
+	egressOnly := workerSystem("127.0.0.1:8080", "", "/data", "/data", false, "")
 	if !strings.HasPrefix(egressOnly, "走代理 127.0.0.1:8080") {
 		t.Fatalf("worker egress-only branch body: %q", egressOnly)
 	}
 	if strings.Contains(egressOnly, "traffic_search") {
 		t.Fatalf("worker without recording must NOT inject trafficTool: %q", egressOnly)
 	}
-	noProxy := workerSystem("", "", "/data", "/data")
+	noProxy := workerSystem("", "", "/data", "/data", false, "")
 	if !strings.HasPrefix(noProxy, "手动") {
 		t.Fatalf("worker no-proxy branch body: %q", noProxy)
 	}
 	if strings.Contains(noProxy, "traffic_search") {
 		t.Fatalf("worker without proxy must NOT inject trafficTool: %q", noProxy)
+	}
+}
+
+func TestTorEgressBlockOnlyWhenTor(t *testing.T) {
+	if got := torEgressBlock(false, ""); got != "" {
+		t.Errorf("non-Tor must add nothing, got %q", got)
+	}
+	got := torEgressBlock(true, "sg")
+	for _, want := range []string{"Tor", "sg", "UDP", "socks5-hostname", ".onion"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("tor block missing %q: %s", want, got)
+		}
+	}
+	if !strings.Contains(workerSystem("socks5h://h:1", "", "/d", "/w", true, "sg"), "出口约束") {
+		t.Error("worker system prompt must carry the Tor block")
 	}
 }

@@ -462,14 +462,24 @@ type Agent struct {
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
+	// 出口策略(Tor):inherit=跟随系统默认;direct=直连(仅显式选择);
+	// proxy=走 egress_proxy;tor=经 Tor SOCKS(强制 socks5h 远程 DNS)。
+	EgressMode     string `json:"egress_mode"`
+	EgressProxy    string `json:"egress_proxy"`
+	TorExitCountry string `json:"tor_exit_country"`
+	TorRotate      string `json:"tor_rotate"`
+	TorCircuitKey  string `json:"tor_circuit_key"`
+	// EgressTorInstance pins this agent to one torpool slot (1-based). 0 = auto
+	// (stable hash of the agent key), so the same agent keeps its exit.
+	EgressTorInstance int `json:"egress_tor_instance"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
+const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id,COALESCE(egress_mode,'inherit'),COALESCE(egress_proxy,''),COALESCE(tor_exit_country,''),COALESCE(tor_rotate,'off'),COALESCE(tor_circuit_key,'task'),COALESCE(egress_tor_instance,0)`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
 	var prof sql.NullInt64 // llm_profile_id 可空:未绑定时为 NULL
-	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof)
+	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof, &a.EgressMode, &a.EgressProxy, &a.TorExitCountry, &a.TorRotate, &a.TorCircuitKey, &a.EgressTorInstance)
 	if err == nil && prof.Valid {
 		v := prof.Int64
 		a.LLMProfileID = &v
@@ -578,6 +588,19 @@ func (d *DB) UpdateAgentMeta(key, name, description string) error {
 // via FK; tools.agents bindings for the key are cleaned by the caller.
 func (d *DB) DeleteAgent(key string) error {
 	_, err := d.Exec(`DELETE FROM agents WHERE key=$1 AND builtin=false`, key)
+	return err
+}
+
+// SetAgentEgress persists an agent's egress policy. Values are validated by the
+// caller; the DB only stores them so a rollback of the binary keeps the setting.
+func (d *DB) SetAgentEgress(key, mode, proxy, country, rotate, circuitKey string, torInstance int) error {
+	if torInstance < 0 {
+		torInstance = 0
+	}
+	_, err := d.Exec(`UPDATE agents SET egress_mode=$2, egress_proxy=NULLIF($3,''),
+		tor_exit_country=NULLIF($4,''), tor_rotate=$5, tor_circuit_key=$6,
+		egress_tor_instance=$7 WHERE key=$1`,
+		key, mode, proxy, country, rotate, circuitKey, torInstance)
 	return err
 }
 
@@ -815,7 +838,7 @@ type MCPServer struct {
 	Env       json.RawMessage `json:"env"`
 	URL       string          `json:"url,omitempty"`
 	Enabled   bool            `json:"enabled"`
-	Insecure  bool            `json:"insecure"` // http: skip TLS cert verification (self-signed servers, issue #108)
+	Insecure  bool            `json:"insecure"`        // http: skip TLS cert verification (self-signed servers, issue #108)
 	Tools     []string        `json:"tools,omitempty"` // cached tool names (mcp_tools_cache)
 }
 

@@ -907,9 +907,45 @@ export interface TrafficHost {
   count: number;
 }
 
+// Tor 实例池状态（GET /api/system/torpool）
+export interface TorPoolInstance {
+  id: number;
+  socks_addr: string;
+  control_addr: string;
+  running: boolean;
+  cookie_ready: boolean;
+  data_dir: string;
+}
+
+export interface TorPoolStatus {
+  enabled: boolean;
+  started: boolean;
+  size: number;
+  ports: string;
+  dir: string;
+  binary: string;
+  instances: TorPoolInstance[];
+}
+
 // ---- App settings (runtime toggles) ----
 export interface Settings {
   traffic_capture: boolean;
+  // 出口策略：fail-closed 开启时，没有匿名出口就拒绝目标流量（不回退直连）
+  egress_strict?: boolean;
+  tor_socks_addr?: string;
+  tor_control_addr?: string;
+  tor_cookie_path?: string;
+  // Tor 实例池（每 Agent 独立出口）：N 个独立 daemon，换电路只影响单个 Agent
+  tor_pool_enabled?: boolean;
+  tor_pool_status?: TorPoolStatus;
+  tor_pool_size?: number;
+  tor_pool_dir?: string;
+  tor_binary?: string;
+  tor_pool_ports?: string;
+  // Tor daemon 自身的上游 HTTP CONNECT 代理（host:port）；直连 guard 被阻断时需要
+  tor_pool_upstream?: string;
+  tor_pool_socks_base?: number;
+  tor_pool_control_base?: number;
   agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认关闭；不影响人工绑定
   llm_record: boolean; // LLM 录制开关（默认关）；关闭时不记录任何 LLM 调用
   // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
@@ -1127,6 +1163,14 @@ export interface Agent {
   trigger_run_mode?: "serial" | "parallel"; // 串行排队 / 每次触发各自并发一个会话
   trigger_merge_mode?: "by_task" | "all" | "none"; // 仅 serial：同任务合并 / 全部合并 / 不合并
   trigger_max_parallel?: number; // 仅 parallel：每 agent 并发上限；0=不限
+  // 出口策略(Tor)：inherit=跟随系统默认；direct；proxy；tor
+  egress_mode?: "inherit" | "direct" | "proxy" | "tor";
+  egress_proxy?: string;
+  tor_exit_country?: string;
+  tor_rotate?: "off" | "per_run" | "per_intent" | "per_task";
+  tor_circuit_key?: "task" | "agent" | "off";
+  // 多 Tor 实例：固定使用池中哪个实例（1-based）；0/未填 = 按 agent key 哈希自动分配
+  egress_tor_instance?: number;
   // 绑定数量(仅列表接口返回)：可见 MCP / 可见 Skill / 绑定工具
   mcp_count?: number;
   skill_count?: number;
@@ -1609,4 +1653,54 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+// ---- Agent 级出口(Tor) ----
+export interface EgressProbe {
+  ip: string;
+  country: string;
+  is_tor: boolean;
+  latency_ms: number;
+  error?: string;
+}
+
+export interface ResolvedEgress {
+  Mode: string;
+  ProxyURL: string;
+  CACert?: string;
+  IsTor?: boolean;
+  CircuitUser?: string;
+  ExitCountry?: string;
+}
+
+export interface EgressRun {
+  id: number;
+  agent_key: string;
+  task_id?: string | null;
+  conversation_id?: number | null;
+  mode: string;
+  egress_hint: string;
+  exit_ip: string;
+  is_tor?: boolean | null;
+  circuit_user: string;
+  inbound_kind: string;
+  inbound_target: string;
+  origin_hidden?: boolean | null;
+  started_at: string;
+  ended_at?: string | null;
+}
+
+// 模型选择器条目：来源 api=供应商 /models 返回，catalog=平台本地清单（API 未列出）
+export interface ModelEntry {
+  id: string;
+  name?: string;
+  context_window?: number;
+  max_output_tokens?: number;
+  input_modalities?: string[];
+  effort_levels?: string[];
+  // 具体构建版本（如 V4.1-Flash-1017）；"v4.1" 是版本号而不是 model id
+  version?: string;
+  latest?: boolean;
+  retired?: boolean;
+  source: "api" | "catalog";
 }

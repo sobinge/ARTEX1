@@ -273,6 +273,9 @@ func (s *Server) buildCustomTool(t *db.Tool) actool.CoreTool {
 		if params == nil {
 			params = map[string]any{}
 		}
+		if err := s.checkToolEgress(t); err != nil {
+			return actool.Errorf(err.Error()), nil
+		}
 		switch kind {
 		case "command":
 			return s.runCommandTool(ctx, execRaw, params, tc)

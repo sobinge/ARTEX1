@@ -796,6 +796,65 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_max_parallel INTEGER NOT NUL
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 -- run_seconds 单次 run 墙钟默认 600→1200:只改列默认(影响将来新插入的行),不动旧库存量行。
 ALTER TABLE agents ALTER COLUMN run_seconds SET DEFAULT 1200;
+-- Agent 级出口策略(Tor 能力)。egress_mode 缺省 inherit = 跟随系统默认出口。
+-- 不带 CHECK:旧库存量安全,写入白名单由后端兜底(与 trigger_* 同策略)。
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS egress_mode      TEXT NOT NULL DEFAULT 'inherit';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS egress_proxy     TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS tor_exit_country TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS tor_rotate       TEXT NOT NULL DEFAULT 'off';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS tor_circuit_key  TEXT NOT NULL DEFAULT 'task';
+-- 多 Tor 实例编排:该 Agent 固定使用哪个实例(1..N);0 = 按 agent key 哈希自动分配。
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS egress_tor_instance INTEGER NOT NULL DEFAULT 0;
+
+-- 出口审计:每次 Agent 运行一行,记录实际使用的出口与探测到的出口 IP(平台侧透明)。
+CREATE TABLE IF NOT EXISTS agent_egress_runs (
+    id              BIGSERIAL PRIMARY KEY,
+    agent_key       TEXT NOT NULL,
+    task_id         BIGINT,
+    conversation_id BIGINT,
+    mode            TEXT NOT NULL,
+    egress_hint     TEXT,
+    exit_ip         TEXT,
+    is_tor          BOOLEAN,
+    circuit_user    TEXT,
+    inbound_kind    TEXT,
+    inbound_target  TEXT,
+    origin_hidden   BOOLEAN,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_aer_agent_time ON agent_egress_runs(agent_key, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_aer_task       ON agent_egress_runs(task_id) WHERE task_id IS NOT NULL;
+
+-- 信标通道(dead-drop)：双方都只做出站连接，任何一方都不监听端口。
+-- psk 保存的是加密后的密钥材料；channel_id 为 128-bit 随机串，与域名/主机名无关。
+CREATE TABLE IF NOT EXISTS beacon_channels (
+    id           BIGSERIAL PRIMARY KEY,
+    channel_id   TEXT NOT NULL UNIQUE,
+    agent_key    TEXT NOT NULL,
+    task_id      TEXT,
+    kind         TEXT NOT NULL,              -- onion | cdn_front | third_party
+    endpoint     TEXT NOT NULL,              -- 目标侧看到的地址
+    psk          BYTEA NOT NULL,
+    last_seq_out BIGINT NOT NULL DEFAULT 0,
+    last_seq_in  BIGINT NOT NULL DEFAULT 0,
+    last_seen_at TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_beacon_agent ON beacon_channels(agent_key);
+
+CREATE TABLE IF NOT EXISTS beacon_messages (
+    id          BIGSERIAL PRIMARY KEY,
+    channel_id  TEXT NOT NULL REFERENCES beacon_channels(channel_id) ON DELETE CASCADE,
+    direction   TEXT NOT NULL,   -- out=指令(平台→目标) in=结果(目标→平台)
+    seq         BIGINT NOT NULL,
+    payload     BYTEA NOT NULL,  -- 已加密的定长帧
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    consumed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_beacon_msg_pending
+    ON beacon_messages(channel_id, direction, seq) WHERE consumed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_agents_llm_profile ON agents(llm_profile_id) WHERE llm_profile_id IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_agents_upd ON agents;
 CREATE TRIGGER trg_agents_upd BEFORE UPDATE ON agents
@@ -944,6 +1003,10 @@ CREATE TABLE IF NOT EXISTS tools (
     deferred    BOOLEAN NOT NULL DEFAULT false,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 工具出口分类(默认 target-probe):决定执行前是否需要匿名出口。
+-- needs_udp = true 的工具在 Tor 出口下必须拒绝执行(Tor 不承载 UDP)。
+ALTER TABLE tools ADD COLUMN IF NOT EXISTS egress_class TEXT NOT NULL DEFAULT 'target-probe';
+ALTER TABLE tools ADD COLUMN IF NOT EXISTS needs_udp    BOOLEAN NOT NULL DEFAULT false;
 DROP TRIGGER IF EXISTS trg_tools_upd ON tools;
 CREATE TRIGGER trg_tools_upd BEFORE UPDATE ON tools
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();

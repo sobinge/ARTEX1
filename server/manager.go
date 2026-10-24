@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/torpool"
 	"github.com/Autumn-27/artex/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -245,6 +247,32 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+	// egressStrict is fail-closed mode: target traffic must have an anonymous
+	// egress, and an unavailable one aborts the action instead of dialing direct.
+	egressStrict bool
+	// torSocksAddr is the Tor SOCKS endpoint used by agents with egress_mode=tor
+	// (e.g. socks5h://172.18.0.1:9050). Empty = fall back to globalProxy.
+	torSocksAddr string
+	// torControlAddr is the Tor control port (e.g. 127.0.0.1:9051) used for
+	// circuit rotation; empty = rotation disabled. torCookiePath is its cookie.
+	torControlAddr string
+	torCookiePath  string
+
+	// --- torpool: N independent Tor daemons (per-agent exits) ---
+	// torPoolEnabled switches resolveEgress from the single shared daemon above
+	// to a pooled instance, which makes SIGNAL NEWNYM per-agent instead of
+	// process-wide.
+	torPoolEnabled     bool
+	torPoolSize        int
+	torPoolSocksBase   int
+	torPoolControlBase int
+	torPoolDir         string
+	torBinary          string
+	// torPoolUpstream routes every daemon's own connections through an HTTP
+	// CONNECT proxy (host:port). Needed where direct access to guard relays is
+	// blocked; empty = direct.
+	torPoolUpstream string
+	torPool         *torpool.Pool
 }
 
 // Settings keys the UI toggles at runtime.
@@ -260,8 +288,34 @@ const (
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
 	settingGlobalProxy = "global_proxy"
-	settingWorkers     = "workers"
-	settingLLMRecord   = "llm_record"
+	// settingEgressStrict turns fail-closed on: a missing/unusable anonymous
+	// egress refuses target traffic instead of silently dialing direct.
+	settingEgressStrict = "egress_strict"
+	// settingTorSocksAddr is the Tor SOCKS endpoint for egress_mode=tor.
+	settingTorSocksAddr = "tor_socks_addr"
+	// settingTorControlAddr enables circuit rotation (SIGNAL NEWNYM).
+	settingTorControlAddr = "tor_control_addr"
+	// settingTorCookiePath is the control-port auth cookie file.
+	settingTorCookiePath = "tor_cookie_path"
+	// --- torpool settings ---
+	// settingTorPoolOn enables the multi-daemon pool; off keeps the single
+	// daemon configured by tor_socks_addr/tor_control_addr.
+	settingTorPoolOn = "tor_pool_enabled"
+	// settingTorPoolSize is the number of daemons (1..32).
+	settingTorPoolSize = "tor_pool_size"
+	// settingTorPoolSocksBase / settingTorPoolControlBase are the ports of slot 1;
+	// slot N uses base+N-1.
+	settingTorPoolSocksBase   = "tor_pool_socks_base"
+	settingTorPoolControlBase = "tor_pool_control_base"
+	// settingTorPoolDir is the root for per-slot DataDirectory/torrc/cookie.
+	settingTorPoolDir = "tor_pool_dir"
+	// settingTorBinary is the tor executable (default "tor").
+	settingTorBinary = "tor_binary"
+	// settingTorPoolUpstream is an optional HTTP CONNECT proxy for the daemons
+	// themselves (host:port), for networks where guard relays are unreachable.
+	settingTorPoolUpstream = "tor_pool_upstream"
+	settingWorkers         = "workers"
+	settingLLMRecord       = "llm_record"
 	// LLM 轮询(故障转移)。默认关闭——开启后走「全局激活配置」的 agent 在当前配置
 	// 不可用(余额不足/key 失效/限流/服务异常)时自动切到下一个配置。
 	// settingLLMPoolBindFallback 仅在轮询开启时有意义:默认关闭,即 agent/任务显式
@@ -431,6 +485,57 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	// Global egress proxy (default: direct). When capture is on, feed it to the
 	// MITM as its upstream so recorded traffic exits through it; when capture is
 	// off, ProxyAddr hands it to agents directly (bash env / WebFetch).
+	// Fail-closed is the default: an install with no egress configured refuses
+	// target traffic rather than silently dialing from the real IP. Operators
+	// opt out explicitly by writing egress_strict=false.
+	m.egressStrict = true
+	if v, ok, _ := pg.GetSetting(settingEgressStrict); ok {
+		m.egressStrict = strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	if v, ok, _ := pg.GetSetting(settingTorSocksAddr); ok {
+		m.torSocksAddr = strings.TrimSpace(v)
+	}
+	if v, ok, _ := pg.GetSetting(settingTorControlAddr); ok {
+		m.torControlAddr = strings.TrimSpace(v)
+	}
+	if v, ok, _ := pg.GetSetting(settingTorCookiePath); ok {
+		m.torCookiePath = strings.TrimSpace(v)
+	}
+	// Tor pool defaults mirror the design doc: 3 daemons, ports 19050+/19150+.
+	m.torPoolSize = 3
+	m.torPoolSocksBase = 19050
+	m.torPoolControlBase = 19150
+	m.torBinary = "tor"
+	if v, ok, _ := pg.GetSetting(settingTorPoolOn); ok {
+		m.torPoolEnabled = strings.EqualFold(strings.TrimSpace(v), "true") || strings.TrimSpace(v) == "1"
+	}
+	if v, ok, _ := pg.GetSetting(settingTorPoolSize); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			m.torPoolSize = n
+		}
+	}
+	if v, ok, _ := pg.GetSetting(settingTorPoolSocksBase); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			m.torPoolSocksBase = n
+		}
+	}
+	if v, ok, _ := pg.GetSetting(settingTorPoolControlBase); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			m.torPoolControlBase = n
+		}
+	}
+	if v, ok, _ := pg.GetSetting(settingTorPoolDir); ok {
+		m.torPoolDir = strings.TrimSpace(v)
+	}
+	if v, ok, _ := pg.GetSetting(settingTorBinary); ok && strings.TrimSpace(v) != "" {
+		m.torBinary = strings.TrimSpace(v)
+	}
+	if v, ok, _ := pg.GetSetting(settingTorPoolUpstream); ok {
+		m.torPoolUpstream = strings.TrimSpace(v)
+	}
+	if m.torPoolDir == "" {
+		m.torPoolDir = filepath.Join(m.dir, "torpool")
+	}
 	if v, ok, _ := pg.GetSetting(settingGlobalProxy); ok {
 		m.globalProxy = strings.TrimSpace(v)
 	}
@@ -443,6 +548,30 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
 	m.syncBrowserMCPProxy()
+	// Host-level tool wrappers (proxy-guard/proxychains shims) override the egress
+	// we inject, so Tor coverage would be a lie without this warning.
+	if dirs, n := detectProxyGuardShims(); n > 0 {
+		log.Printf("[egress] 警告: PATH 中存在 %d 个代理包装器(%s)，这些工具会忽略平台注入的出口(Tor)，"+
+			"继续走包装器指定的代理；要真正走 Tor 请移除包装器或把 proxychains 指向 Tor SOCKS",
+			n, strings.Join(dirs, ", "))
+	}
+
+	// Boot the pooled Tor daemons when enabled. Failure is logged, not fatal:
+	// the platform must still start so the operator can fix the setting from the
+	// UI, and egress stays fail-closed meanwhile.
+	if m.torPoolEnabled {
+		torpool.SetLogger(log.Printf)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			if err := m.StartTorPool(ctx); err != nil {
+				log.Printf("[torpool] 启动失败: %v", err)
+			} else {
+				log.Printf("[torpool] 已启动 %d 个实例: %s", m.TorPoolStatus().Size, m.TorPoolStatus().Ports)
+			}
+		}()
+	}
+
 	return m, nil
 }
 
@@ -764,6 +893,78 @@ func (m *Manager) ProxyCACert() string {
 		return ""
 	}
 	return m.traffic.CACertPath()
+}
+
+// EgressStrict reports fail-closed mode.
+func (m *Manager) EgressStrict() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.egressStrict
+}
+
+// SetEgressStrict persists fail-closed mode. Callers must rebuild agents so the
+// capture-off path picks it up.
+func (m *Manager) SetEgressStrict(v bool) error {
+	if err := m.pg.SetSetting(settingEgressStrict, fmt.Sprintf("%t", v)); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.egressStrict = v
+	m.mu.Unlock()
+	return nil
+}
+
+// TorControlAddr / TorCookiePath expose the control-port settings for rotation.
+func (m *Manager) TorControlAddr() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.torControlAddr
+}
+
+// TorCookiePath returns the control-port auth cookie path.
+func (m *Manager) TorCookiePath() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.torCookiePath
+}
+
+// SetTorControl persists the control endpoint + cookie path (both optional).
+func (m *Manager) SetTorControl(addr, cookiePath string) error {
+	addr, cookiePath = strings.TrimSpace(addr), strings.TrimSpace(cookiePath)
+	if err := m.pg.SetSetting(settingTorControlAddr, addr); err != nil {
+		return err
+	}
+	if err := m.pg.SetSetting(settingTorCookiePath, cookiePath); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.torControlAddr, m.torCookiePath = addr, cookiePath
+	m.mu.Unlock()
+	return nil
+}
+
+// TorSocksAddr returns the Tor SOCKS endpoint used by egress_mode=tor.
+func (m *Manager) TorSocksAddr() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.torSocksAddr
+}
+
+// SetTorSocksAddr persists the Tor SOCKS endpoint after validating its scheme.
+func (m *Manager) SetTorSocksAddr(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw != "" {
+		if _, err := traffic.ValidateProxyURL(raw); err != nil {
+			return err
+		}
+	}
+	if err := m.pg.SetSetting(settingTorSocksAddr, raw); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.torSocksAddr = raw
+	m.mu.Unlock()
+	return nil
 }
 
 // GlobalProxy returns the configured global egress proxy URL (empty = direct).

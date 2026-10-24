@@ -27,7 +27,8 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import type {
+  ModelEntry, LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
@@ -331,7 +332,7 @@ function ProfileSheet({
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
-  const [models, setModels] = React.useState<string[]>([]);
+  const [models, setModels] = React.useState<ModelEntry[]>([]);
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
 
@@ -370,10 +371,19 @@ function ProfileSheet({
     setModels([]);
     try {
       const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
-      if (r.ok && r.models && r.models.length > 0) {
-        setModels(r.models);
+      const entries: ModelEntry[] = r.entries && r.entries.length > 0
+        ? r.entries
+        : (r.models ?? []).map((id) => ({ id, source: "api" as const }));
+      if (entries.length > 0) {
+        setModels(entries);
         setModelsOpen(true);
-        toast.success(`已加载 ${r.models.length} 个模型`);
+        const fromApi = entries.filter((e) => e.source === "api").length;
+        const extra = entries.length - fromApi;
+        toast.success(
+          extra > 0
+            ? `已加载 ${entries.length} 个模型（API ${fromApi} + 本地清单 ${extra}）`
+            : `已加载 ${entries.length} 个模型`,
+        );
       } else {
         toast.error(`加载模型失败：${r.error ?? "未获取到模型"}`);
       }
@@ -532,20 +542,61 @@ function ProfileSheet({
                   </Button>
                 </PopoverTrigger>
                 {models.length > 0 && (
-                  <PopoverContent className="max-h-72 w-72 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
-                    {models.map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground"
-                        onClick={() => {
-                          setModel(m);
-                          setModelsOpen(false);
-                        }}
-                      >
-                        {m}
-                      </button>
-                    ))}
+                  <PopoverContent className="max-h-80 w-96 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
+                    {(["api", "catalog"] as const).map((src) => {
+                      const group = models.filter((m) => m.source === src);
+                      if (group.length === 0) return null;
+                      return (
+                        <div key={src} className="mb-1">
+                          <div className="px-2 py-1 text-[11px] font-medium text-muted-foreground">
+                            {src === "api" ? "API 返回" : "兼容/旧名（API 不列出，仍可用）"}
+                          </div>
+                          {group.map((m) => (
+                            <button
+                              key={m.id}
+                              type="button"
+                              className="w-full shrink-0 rounded-md px-2 py-1.5 text-left hover:bg-accent hover:text-accent-foreground"
+                              onClick={() => {
+                                setModel(m.id);
+                                if (m.context_window && m.context_window > 0) {
+                                  setCw(String(Math.round(m.context_window / 1024)));
+                                }
+                                setModelsOpen(false);
+                              }}
+                            >
+                              <div className="flex items-baseline justify-between gap-3">
+                                <span className="flex items-center gap-1 font-mono text-xs">
+                                  {m.id}
+                                  {m.latest ? (
+                                    <span className="rounded bg-emerald-500/15 px-1 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                                      最新 {m.version ?? ""}
+                                    </span>
+                                  ) : null}
+                                  {m.retired ? (
+                                    <span className="rounded bg-amber-500/15 px-1 text-[10px] font-medium text-amber-600 dark:text-amber-500">
+                                      已退役
+                                    </span>
+                                  ) : null}
+                                </span>
+                                {m.context_window ? (
+                                  <span className="shrink-0 text-[11px] text-muted-foreground">
+                                    {Math.round(m.context_window / 1024)}K ctx
+                                  </span>
+                                ) : null}
+                              </div>
+                              {m.name && m.name !== m.id ? (
+                                <div className="text-[11px] text-muted-foreground">
+                                  {m.name}
+                                  {!m.latest && m.version && !m.retired ? ` · ${m.version}` : ""}
+                                  {m.input_modalities?.includes("image") ? " · 支持图片" : ""}
+                                  {m.effort_levels?.length ? ` · effort: ${m.effort_levels.join("/")}` : ""}
+                                </div>
+                              ) : null}
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })}
                   </PopoverContent>
                 )}
               </Popover>

@@ -20,9 +20,12 @@ type Tool struct {
 	Exec        json.RawMessage `json:"exec"`     // 自定义工具执行规格(kind!=builtin)
 	Deferred    bool            `json:"deferred"` // schema 延迟(走 SearchExtraTools/ExecuteExtraTool)
 	Calls       int             `json:"calls"`    // runtime ledger aggregate; not stored in tools
+	// EgressClass 决定执行前是否需要匿名出口；NeedsUDP 的工具在 Tor 下必须拒绝。
+	EgressClass string `json:"egress_class"`
+	NeedsUDP    bool   `json:"needs_udp"`
 }
 
-const toolCols = `key, system, description, schema, agents, enabled, kind, exec, deferred`
+const toolCols = `key, system, description, schema, agents, enabled, kind, exec, deferred, COALESCE(egress_class,'target-probe'), COALESCE(needs_udp,false)`
 
 // SeedTool inserts a built-in tool's code-defined defaults ONCE. ON CONFLICT DO
 // NOTHING: an existing row (possibly edited in the UI) is never overwritten on
@@ -107,7 +110,7 @@ func (d *DB) RefreshToolDefaults(key, desc string, schema json.RawMessage) error
 func scanTool(rows interface{ Scan(...any) error }) (*Tool, error) {
 	var t Tool
 	var agents []byte
-	if err := rows.Scan(&t.Key, &t.System, &t.Description, &t.Schema, &agents, &t.Enabled, &t.Kind, &t.Exec, &t.Deferred); err != nil {
+	if err := rows.Scan(&t.Key, &t.System, &t.Description, &t.Schema, &agents, &t.Enabled, &t.Kind, &t.Exec, &t.Deferred, &t.EgressClass, &t.NeedsUDP); err != nil {
 		return nil, err
 	}
 	if len(agents) > 0 {

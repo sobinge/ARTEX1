@@ -23,13 +23,16 @@ import (
 // LS/Glob/Grep) plus whatever skills/MCP the key is made visible; NO pentest
 // graph/task context is injected (that stays exclusive to MainAgent).
 type ChatAgent struct {
-	prov           llm.Provider
-	model          string
-	workDir        string
-	tx             *transcript.Store
-	window         int
-	proxyAddr      string
-	proxyCACert    string
+	prov        llm.Provider
+	model       string
+	workDir     string
+	tx          *transcript.Store
+	window      int
+	proxyAddr   string
+	proxyCACert string
+	// egressResolve, when set, overrides the static proxy for a single Chat call
+	// with the per-agent egress (custom session agents carry their own policy).
+	egressResolve  func(agentKey string) (addr, ca string, tor bool, country string)
 	webSearch      WebSearchOpts
 	guard          *guard.Guard // optional; nil disables intercept hooks for chat
 	nonStreamingFn func() bool  // resolver: use non-streaming (Complete) path? (nil = streaming)
@@ -66,6 +69,12 @@ func (c *ChatAgent) maxTokens() int {
 // SetProxy points the chat agent's WebFetch/Bash at the recording proxy plus the
 // CA cert it trusts (empty addr = direct). Kept for parity with the other agents.
 func (c *ChatAgent) SetProxy(addr, caCert string) { c.proxyAddr, c.proxyCACert = addr, caCert }
+
+// SetEgressResolver installs a per-agent egress resolver. Called on every Chat so
+// a custom session agent's own egress policy wins over the shared default.
+func (c *ChatAgent) SetEgressResolver(fn func(agentKey string) (addr, ca string, tor bool, country string)) {
+	c.egressResolve = fn
+}
 
 // SetWebSearch selects the web_search backend for the chat agent (off by default).
 func (c *ChatAgent) SetWebSearch(o WebSearchOpts) { c.webSearch = o }
@@ -123,7 +132,11 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()
 
-	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir), def)
+	proxyAddr, proxyCA, torEgress, torCountry := c.proxyAddr, c.proxyCACert, false, ""
+	if c.egressResolve != nil {
+		proxyAddr, proxyCA, torEgress, torCountry = c.egressResolve(agentKey)
+	}
+	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir)+torEgressBlock(torEgress, torCountry), def)
 	opts := agentcore.Options{
 		Provider:        c.prov,
 		SystemPrompt:    system,
@@ -133,8 +146,8 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
 		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
-		WebFetchProxy:   c.proxyAddr,
-		WebFetchCACert:  c.proxyCACert,
+		WebFetchProxy:   proxyAddr,
+		WebFetchCACert:  proxyCA,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
 		EnableWebSearch:       ws.Enabled,
@@ -145,7 +158,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		DeepSeekSearchAPIKey:  ws.DeepSeekAPIKey,
 		DeepSeekSearchModel:   ws.DeepSeekModel,
 		WebSearchProxy:        ws.Proxy,
-		BashEnv:               proxyEnv(c.proxyAddr, c.proxyCACert), // Bash 子命令默认走代理+信任 CA
+		BashEnv:               proxyEnv(proxyAddr, proxyCA), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:            sessionWorkDir,
 		MaxTurns:              maxTurns,
 		MaxDuration:           maxDuration,

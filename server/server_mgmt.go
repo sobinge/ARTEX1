@@ -27,6 +27,8 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
+
+	"github.com/Autumn-27/artex/traffic"
 )
 
 // validSkillName checks the agentskills.io name constraints, widened so a skill can
@@ -248,7 +250,16 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	var req struct{ Key, Name, Description string }
+	var req struct {
+		Key, Name, Description string
+		EgressMode             string `json:"egress_mode"`
+		EgressProxy            string `json:"egress_proxy"`
+		TorExitCountry         string `json:"tor_exit_country"`
+		TorRotate              string `json:"tor_rotate"`
+		TorCircuitKey          string `json:"tor_circuit_key"`
+		// EgressTorInstance pins the agent to one torpool slot (1-based, 0=auto).
+		EgressTorInstance int `json:"egress_tor_instance"`
+	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -274,6 +285,33 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 	// starter prompt so the editor shows something editable from the start.
 	if err := pg.SeedPromptIfEmpty(a.ID, agent.DefaultAssistantPrompt); err != nil {
 		log.Printf("[agents] seed starter prompt for %s 失败: %v", a.Key, err)
+	}
+	// 可选:创建时就带上出口策略(自定义会话 Agent 常见需求)。
+	if m := strings.TrimSpace(req.EgressMode); m != "" && m != "inherit" {
+		switch m {
+		case "direct", "proxy", "tor":
+		default:
+			writeErr(w, 400, "egress_mode 需为 inherit/direct/proxy/tor")
+			return
+		}
+		rotate := strings.TrimSpace(req.TorRotate)
+		if rotate == "" {
+			rotate = "off"
+		}
+		circuit := strings.TrimSpace(req.TorCircuitKey)
+		if circuit == "" {
+			circuit = "task"
+		}
+		torInst, ierr := s.validateTorInstance(req.EgressTorInstance)
+		if ierr != nil {
+			writeErr(w, 400, ierr.Error())
+			return
+		}
+		if err := pg.SetAgentEgress(a.Key, m, strings.TrimSpace(req.EgressProxy),
+			strings.TrimSpace(req.TorExitCountry), rotate, circuit, torInst); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	writeJSON(w, 200, agentDTO(a))
 }
@@ -367,6 +405,14 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		TriggerRunMode     *string `json:"trigger_run_mode"`
 		TriggerMergeMode   *string `json:"trigger_merge_mode"`
 		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
+		// 出口策略(Tor)。缺省=不动；空串=回到默认(inherit / off / task)。
+		EgressMode     *string `json:"egress_mode"`
+		EgressProxy    *string `json:"egress_proxy"`
+		TorExitCountry *string `json:"tor_exit_country"`
+		TorRotate      *string `json:"tor_rotate"`
+		TorCircuitKey  *string `json:"tor_circuit_key"`
+		// EgressTorInstance: nil = untouched, 0 = auto, >0 = fixed slot.
+		EgressTorInstance *int `json:"egress_tor_instance"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -437,6 +483,74 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 			maxPar = *req.TriggerMaxParallel
 		}
 		if err := pg.SetAgentTriggerBehavior(a.Key, runMode, mergeMode, maxPar); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	// 出口策略:任一下发即整体写入,缺省字段用存量回填(与 trigger 同策略)。
+	if req.EgressMode != nil || req.EgressProxy != nil || req.TorExitCountry != nil ||
+		req.TorRotate != nil || req.TorCircuitKey != nil || req.EgressTorInstance != nil {
+		torInst := a.EgressTorInstance
+		if req.EgressTorInstance != nil {
+			v, err := s.validateTorInstance(*req.EgressTorInstance)
+			if err != nil {
+				writeErr(w, 400, err.Error())
+				return
+			}
+			torInst = v
+		}
+		mode, proxy, country, rotate, circuit := a.EgressMode, a.EgressProxy,
+			a.TorExitCountry, a.TorRotate, a.TorCircuitKey
+		if req.EgressMode != nil {
+			mode = strings.TrimSpace(*req.EgressMode)
+		}
+		if req.EgressProxy != nil {
+			proxy = strings.TrimSpace(*req.EgressProxy)
+		}
+		if req.TorExitCountry != nil {
+			country = strings.TrimSpace(*req.TorExitCountry)
+		}
+		if req.TorRotate != nil {
+			rotate = strings.TrimSpace(*req.TorRotate)
+		}
+		if req.TorCircuitKey != nil {
+			circuit = strings.TrimSpace(*req.TorCircuitKey)
+		}
+		switch mode {
+		case "inherit", "direct", "proxy", "tor":
+		default:
+			writeErr(w, 400, "egress_mode 需为 inherit/direct/proxy/tor")
+			return
+		}
+		if mode == "proxy" && proxy == "" {
+			writeErr(w, 400, "egress_mode=proxy 需要 egress_proxy")
+			return
+		}
+		if proxy != "" {
+			if _, err := traffic.ValidateProxyURL(proxy); err != nil {
+				writeErr(w, 400, err.Error())
+				return
+			}
+		}
+		switch rotate {
+		case "", "off", "per_run", "per_intent", "per_task":
+		default:
+			writeErr(w, 400, "tor_rotate 需为 off/per_run/per_intent/per_task")
+			return
+		}
+		switch circuit {
+		case "", "task", "agent", "off":
+		default:
+			writeErr(w, 400, "tor_circuit_key 需为 task/agent/off")
+			return
+		}
+		if rotate == "" {
+			rotate = "off"
+		}
+		if circuit == "" {
+			circuit = "task"
+		}
+		if err := pg.SetAgentEgress(a.Key, mode, proxy, country, rotate, circuit, torInst); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -2079,30 +2193,58 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			lastErr = fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(body[:min(len(body), 512)]))
 			continue
 		}
-		// Both OpenAI and Anthropic return {"data": [{"id": "..."},...]}.
+		// Both OpenAI and Anthropic return {"data": [{"id": "..."},...]}; DeepSeek
+		// additionally reports name / context_window / modalities / effort.
 		var parsed struct {
 			Data []struct {
-				ID string `json:"id"`
+				ID              string   `json:"id"`
+				Name            string   `json:"name"`
+				ContextWindow   int      `json:"context_window"`
+				MaxOutputTokens int      `json:"max_output_tokens"`
+				InputModalities []string `json:"input_modalities"`
+				Effort          struct {
+					SupportedLevels []string `json:"supported_levels"`
+				} `json:"effort"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(body, &parsed); err != nil {
 			lastErr = "解析响应失败: " + err.Error()
 			continue
 		}
-		models := make([]string, 0, len(parsed.Data))
+		apiEntries := make([]ModelEntry, 0, len(parsed.Data))
 		for _, m := range parsed.Data {
-			if m.ID != "" {
-				models = append(models, m.ID)
+			if m.ID == "" {
+				continue
 			}
+			apiEntries = append(apiEntries, ModelEntry{
+				ID:              m.ID,
+				Name:            m.Name,
+				ContextWindow:   m.ContextWindow,
+				MaxOutputTokens: m.MaxOutputTokens,
+				InputModalities: m.InputModalities,
+				EffortLevels:    m.Effort.SupportedLevels,
+			})
 		}
-		if len(models) > 0 {
-			writeJSON(w, 200, map[string]any{"ok": true, "models": models})
+		if len(apiEntries) > 0 {
+			entries := mergeModelEntries(apiEntries, catalogFor(baseURL))
+			writeJSON(w, 200, map[string]any{
+				"ok":      true,
+				"models":  modelIDs(entries),
+				"entries": entries,
+			})
 			return
 		}
 		emptyOK = true // 200 but no model ids — keep trying other candidates
 	}
 	if emptyOK {
-		writeJSON(w, 200, map[string]any{"ok": true, "models": []string{}})
+		// /models 返回 200 但没有条目：把本地清单给他，并标注来源为 catalog。
+		entries := mergeModelEntries(nil, catalogFor(baseURL))
+		writeJSON(w, 200, map[string]any{
+			"ok":      len(entries) > 0,
+			"models":  modelIDs(entries),
+			"entries": entries,
+			"error":   "API 未返回模型列表，以下为本地清单（可手动验证）",
+		})
 		return
 	}
 	if lastErr == "" {

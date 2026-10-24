@@ -151,6 +151,9 @@ type Engine struct {
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+	// egressAudit, when wired, opens an egress audit row per work run and returns a
+	// finisher called once the run (including model_error retries) is over.
+	egressAudit func(taskID, agentKey string) func(error)
 }
 
 type taskRuntime struct {
@@ -710,6 +713,9 @@ func (e *Engine) SetAgentResolver(fn func(t *Task) (*agent.Planner, *agent.Worke
 // SetAuthoritativeAgentResolver installs a resolver whose nil result must not
 // fall through to the global provider. Task-level failover chains use this so a
 // fully exhausted chain cannot silently bypass its configured boundary.
+// SetEgressAudit wires per-work egress auditing (Tor transparency record).
+func (e *Engine) SetEgressAudit(fn func(taskID, agentKey string) func(error)) { e.egressAudit = fn }
+
 func (e *Engine) SetAuthoritativeAgentResolver(fn func(t *Task) (*agent.Planner, *agent.Worker)) {
 	e.resolve = fn
 	e.resolveAuthoritative = true
@@ -1015,6 +1021,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
+	var finishEgress func(error)
+	if e.egressAudit != nil {
+		finishEgress = e.egressAudit(t.ID, canonicalEgressAgent(name))
+	}
 	var reason harness.TerminalReason
 	var wrote agent.WriteCounts
 	var err error
@@ -1043,6 +1053,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
 		}
 		e.EndLLMCall(t.ID)
+	}
+	if finishEgress != nil {
+		finishEgress(err)
 	}
 	// Capture kill state before detachWork cancels workCtx. kill = this work's
 	// ctx was cancelled (planner kill_work) while the TASK ctx kept running; a

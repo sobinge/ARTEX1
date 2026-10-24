@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -57,6 +59,8 @@ type Worker struct {
 	model           string
 	workDir         string
 	proxyAddr       string
+	torEgress       bool
+	torExitCountry  string
 	proxyCACert     string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
 	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
 	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
@@ -188,8 +192,25 @@ func (w *Worker) compactionWindow() int {
 // that MITM proxy. Empty addr disables the hint.
 func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = addr, caCert }
 
+// SetTorEgress marks this run as egressing through Tor so the system prompt can
+// carry the Tor constraints (no UDP, no mass scanning, remote DNS only).
+func (w *Worker) SetTorEgress(on bool, exitCountry string) {
+	w.torEgress, w.torExitCountry = on, exitCountry
+}
+
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
+
+// remoteDNSProxy rewrites a socks5:// proxy URL to socks5h:// so name resolution
+// happens at the proxy. http(s) proxies already resolve remotely (CONNECT host),
+// and an explicit socks5h:// is left untouched.
+func remoteDNSProxy(proxyAddr string) string {
+	const plain = "socks5://"
+	if len(proxyAddr) >= len(plain) && strings.EqualFold(proxyAddr[:len(plain)], plain) {
+		return "socks5h://" + proxyAddr[len(plain):]
+	}
+	return proxyAddr
+}
 
 // proxyEnv builds the Bash-subprocess env that routes child-command HTTP through
 // the egress proxy (the recording MITM when capture is on, or the global proxy
@@ -202,14 +223,27 @@ func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
 // only reads from ALL_PROXY, not HTTP(S)_PROXY) works in the capture-off path.
 // Empty proxyAddr → nil (direct, unchanged env).
 func proxyEnv(proxyAddr, caCert string) []string {
-	if proxyAddr == "" {
+	// A host-level ~/.curlrc (or ~/.wgetrc) overrides every proxy env var, so an
+	// agent could be configured for Tor and still exit through whatever proxy the
+	// operator's shell configures. Point the curl/wget config dirs at files we
+	// generate from the resolved egress: that is the only place with higher
+	// precedence than the user's own rc file.
+	cfgDir, cfgErr := writeEgressRCCfg(proxyAddr)
+	if proxyAddr == "" && cfgErr != nil {
 		return nil
 	}
+	// A SOCKS5 egress must be advertised as socks5h: curl (and most CLIs) resolve
+	// names locally for socks5://, which both leaks the target name to the local
+	// resolver and makes .onion unreachable. socks5h pushes resolution to the proxy.
+	proxyAddr = remoteDNSProxy(proxyAddr)
 	env := []string{
 		"HTTP_PROXY=" + proxyAddr, "HTTPS_PROXY=" + proxyAddr,
 		"http_proxy=" + proxyAddr, "https_proxy=" + proxyAddr,
 		"ALL_PROXY=" + proxyAddr, "all_proxy=" + proxyAddr, // socks5 egress: curl reads only this
 		"NODE_USE_ENV_PROXY=1", // Node 24+: honor HTTP(S)_PROXY in built-in fetch/http
+	}
+	if cfgErr == nil {
+		env = append(env, "CURL_HOME="+cfgDir, "WGETRC="+filepath.Join(cfgDir, ".wgetrc"))
 	}
 	if caCert != "" {
 		env = append(env,
@@ -221,6 +255,37 @@ func proxyEnv(proxyAddr, caCert string) []string {
 		)
 	}
 	return env
+}
+
+// writeEgressRCCfg materialises curl/wget config for one resolved egress.
+//
+// An empty proxyAddr means "direct", and it still needs a config file: without
+// one, a host ~/.curlrc that pins a proxy would silently send "direct" traffic
+// through that proxy. In that case the generated .curlrc disables proxying.
+func writeEgressRCCfg(proxyAddr string) (string, error) {
+	sum := sha256.Sum256([]byte(proxyAddr))
+	dir := filepath.Join(os.TempDir(), "artex-egress-"+hex.EncodeToString(sum[:6]))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	var curlrc, wgetrc string
+	if proxyAddr == "" {
+		curlrc = "noproxy = \"*\"\n"
+		wgetrc = "use_proxy = off\n"
+	} else {
+		curlrc = "proxy = \"" + proxyAddr + "\"\n" +
+			"noproxy = \"localhost,127.0.0.1,::1\"\n"
+		wgetrc = "use_proxy = on\n" +
+			"http_proxy = " + proxyAddr + "\n" +
+			"https_proxy = " + proxyAddr + "\n"
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".curlrc"), []byte(curlrc), 0o600); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".wgetrc"), []byte(wgetrc), 0o600); err != nil {
+		return "", err
+	}
+	return dir, nil
 }
 
 // workerDefaultTmpl is the built-in EDITABLE body (段 [A]) of the worker system
@@ -285,12 +350,12 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
-func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
+func workerSystem(proxyAddr, caCert, dataDir, runDir string, tor bool, torCountry string) string {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	return body + workerTrafficBlock(caCert != "") + torEgressBlock(tor, torCountry) + workerArtifactSpec(runDir)
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -393,7 +458,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir, w.torEgress, w.torExitCountry)
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}

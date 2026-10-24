@@ -36,6 +36,14 @@ const nextConfig = {
             const backend = process.env.AUTOPENTEST_API ?? "http://localhost:8787";
             return [{ source: "/api/:path*", destination: `${backend}/api/:path*` }];
           },
+          // 开发态 SSE 走不了 Next 的 /api 反代（会被缓冲），sseUrl() 因此直连后端；
+          // 端口必须与上面的 AUTOPENTEST_API 一致，否则活动流连的是默认 :8787 → 页面
+          // "没有响应"。这里把它显式导出，避免换端口后还要手工设 NEXT_PUBLIC_SSE_BASE。
+          env: {
+            NEXT_PUBLIC_SSE_BASE:
+              process.env.NEXT_PUBLIC_SSE_BASE ??
+              (process.env.AUTOPENTEST_API ?? "").replace(/\/+$/, ""),
+          },
         }),
 };
 

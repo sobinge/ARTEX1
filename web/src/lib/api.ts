@@ -13,6 +13,12 @@ import type {
   AgentDetail,
   AgentTrigger,
   ArchiveBatchItem,
+  EgressProbe,
+  ModelEntry,
+  TorPoolInstance,
+  TorPoolStatus,
+  EgressRun,
+  ResolvedEgress,
   Asset,
   AssetInterceptRule,
   AssetInterceptRuleInput,
@@ -987,7 +993,7 @@ export const api = {
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
   fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
-    post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
+    post<{ ok: boolean; error?: string; models?: string[]; entries?: ModelEntry[] }>("/llm/models", {
       provider,
       base_url,
       api_key,
@@ -998,6 +1004,47 @@ export const api = {
   // ---- agents ----
   agents: () => get<{ agents: Agent[] }>("/agents").then((r) => arr(r.agents)),
   getAgent: (key: string) => get<AgentDetail>(`/agents/${key}`),
+  // Agent 级出口(Tor)
+  getAgentEgress: (key: string) =>
+    get<{ ok: boolean; mode: string; resolved?: ResolvedEgress; error?: string }>(`/agents/${key}/egress`),
+  testAgentEgress: (key: string) =>
+    post<{ ok: boolean; probe?: EgressProbe; resolved?: ResolvedEgress; error?: string }>(`/agents/${key}/egress/test`, {}),
+  agentEgressNewNym: (key: string) => post<{ ok: boolean }>(`/agents/${key}/egress/newnym`, {}),
+  agentEgressRuns: (key: string) => get<{ runs: EgressRun[] }>(`/agents/${key}/egress/runs`),
+  // Tor 实例池
+  torPool: () => get<{ ok: boolean; enabled: boolean; status: TorPoolStatus; instances?: TorPoolInstance[] }>(`/system/torpool`),
+  torPoolStart: () => post<{ ok: boolean; status: TorPoolStatus }>(`/system/torpool/start`, {}),
+  torPoolStop: () => post<{ ok: boolean; status: TorPoolStatus }>(`/system/torpool/stop`, {}),
+  torPoolUpdate: (body: { enabled: boolean; size: number; socks_base: number; control_base: number; dir: string; binary: string; upstream: string }) =>
+    put<{ ok: boolean; status: TorPoolStatus }>(`/system/torpool`, body),
+  // 入站通道（Onion + 客户端授权）
+  inboundOnionServices: () =>
+    get<{ services: { name: string; onion: string; clients: string[]; clients_n: number }[] }>(`/inbound/onion`),
+  createInboundOnion: (input: { name: string; target: string }) =>
+    post<{ ok: boolean; dir: string; torrc: string; onion: string; clients: string[]; note: string }>(`/inbound/onion`, input),
+  addInboundOnionClient: (name: string, client: string) =>
+    post<{ ok: boolean; client: string; fingerprint: string; auth_private: string; applied: boolean; note: string }>(
+      `/inbound/onion/${name}/clients`, { client },
+    ),
+  revokeInboundOnionClient: (name: string, client: string) =>
+    del<{ ok: boolean; applied: boolean; clients: string[] }>(`/inbound/onion/${name}/clients/${client}`),
+  enableOnionService: (name: string) =>
+    post<{ ok: boolean; torrc: string; clients: string[] }>(`/inbound/onion/${name}/enable`, {}),
+  // 信标通道（dead-drop）
+  beaconChannels: () =>
+    get<{ channels: { channel_id: string; agent_key: string; task_id?: string | null; kind: string; endpoint: string; last_seen_at?: string | null; silent_secs?: number | null; created_at: string; revoked_at?: string | null }[] }>(
+      `/beacon/channels`,
+    ),
+  createBeaconChannel: (input: { agent_key: string; task_id?: string; kind: string; endpoint: string }) =>
+    post<{ ok: boolean; channel_id: string; psk: string; note: string }>(`/beacon/channels`, input),
+  enqueueBeaconCommand: (channel: string, payload: string) =>
+    post<{ ok: boolean; seq: number }>(`/beacon/channels/${channel}/commands`, { payload }),
+  revokeBeaconChannel: (channel: string) =>
+    post<{ ok: boolean }>(`/beacon/channels/${channel}/revoke`, {}),
+  flushBeaconOutbox: (channel: string) =>
+    post<{ ok: boolean; sent: number }>(`/beacon/channels/${channel}/flush`, {}),
+  pullBeaconInbox: (channel: string) =>
+    post<{ ok: boolean; messages: { seq: number; payload: string }[] }>(`/beacon/channels/${channel}/pull`, {}),
   createAgent: (key: string, name: string, description = "") => post<Agent>("/agents", { key, name, description }),
   updateAgent: (key: string, name: string, description = "") =>
     patch<{ ok: boolean }>(`/agents/${key}`, { name, description }),
@@ -1071,6 +1118,12 @@ export const api = {
       trigger_run_mode?: "serial" | "parallel";
       trigger_merge_mode?: "by_task" | "all" | "none";
       trigger_max_parallel?: number;
+      egress_mode?: "inherit" | "direct" | "proxy" | "tor";
+      egress_proxy?: string;
+      tor_exit_country?: string;
+      tor_rotate?: "off" | "per_run" | "per_intent" | "per_task";
+      tor_circuit_key?: "task" | "agent" | "off";
+      egress_tor_instance?: number;
     },
   ) => put<{ ok: boolean }>(`/agents/${key}/config`, patch),
   agentPromptVersions: (key: string) =>

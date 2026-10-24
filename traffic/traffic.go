@@ -310,7 +310,7 @@ func (t *Traffic) ProxyAddr() string {
 }
 
 // SetUpstreamProxy points every captured request at a global egress proxy
-// (http/https/socks5, optional user:pass in the URL). An empty raw string clears
+// (http/https/socks5/socks5h, optional user:pass in the URL). An empty raw string clears
 // it, restoring direct dialing. The change is atomic and takes effect on the next
 // connection — no restart, no proxy rebuild. go-mitmproxy dials all three schemes
 // itself, so socks5 works uniformly here regardless of the target tool.
@@ -327,8 +327,8 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	return nil
 }
 
-// ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
-// user:pass), returning the parsed URL. Exposed so callers can validate a global
+// ValidateProxyURL parses and checks a proxy URL (http/https/socks5/socks5h,
+// optional user:pass), returning the parsed URL. Exposed so callers can validate a global
 // proxy before persisting it even when the traffic proxy itself is disabled.
 func ValidateProxyURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
@@ -338,15 +338,27 @@ func ValidateProxyURL(raw string) (*url.URL, error) {
 	}
 	switch u.Scheme {
 	case "http", "https", "socks5":
+	case "socks5h":
+		// socks5h is curl's spelling for "let the proxy resolve names". The
+		// dialer (go-mitmproxy → x/net/proxy) already sends hostnames as
+		// ATYP=domain, so both behave identically here; normalize so the
+		// scheme check downstream keeps seeing one known value.
+		u.Scheme = "socks5"
 	case "":
-		return nil, fmt.Errorf("代理 %q 缺少协议(用 http://、https:// 或 socks5://)", raw)
+		return nil, fmt.Errorf("代理 %q 缺少协议(用 http://、https://、socks5:// 或 socks5h://)", raw)
 	default:
-		return nil, fmt.Errorf("不支持的代理协议 %q(用 http、https 或 socks5)", u.Scheme)
+		return nil, fmt.Errorf("不支持的代理协议 %q(用 http、https、socks5 或 socks5h)", u.Scheme)
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("代理 %q 缺少主机地址", raw)
 	}
 	return u, nil
+}
+
+// RemoteDNS reports whether a proxy URL asks for proxy-side name resolution.
+func RemoteDNS(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && strings.EqualFold(u.Scheme, "socks5h")
 }
 
 // CACertPath returns the PEM CA cert clients must trust to verify HTTPS through

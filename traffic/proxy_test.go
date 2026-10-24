@@ -78,3 +78,22 @@ func TestProxyAddr(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateProxyURLSocks5h(t *testing.T) {
+	u, err := ValidateProxyURL("socks5h://user:pass@10.0.0.1:1080")
+	if err != nil {
+		t.Fatalf("socks5h rejected: %v", err)
+	}
+	if u.Scheme != "socks5" {
+		t.Errorf("scheme = %q, want normalized to socks5", u.Scheme)
+	}
+	if u.Host != "10.0.0.1:1080" || u.User == nil {
+		t.Errorf("host/user lost: %v", u)
+	}
+	if !RemoteDNS("socks5h://10.0.0.1:1080") {
+		t.Error("RemoteDNS(socks5h) = false")
+	}
+	if RemoteDNS("socks5://10.0.0.1:1080") {
+		t.Error("RemoteDNS(socks5) = true")
+	}
+}

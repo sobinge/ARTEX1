@@ -10,6 +10,14 @@ cd "$(dirname "$0")"
 cleanup() { kill 0 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
+# —— 出网代理 env（显式固定）—— 与 start.sh / 系统设置「全局出口代理」一致。
+ARTEX_PROXY_HOST="${ARTEX_PROXY_HOST:-127.0.0.1:7897}"
+export http_proxy="http://${ARTEX_PROXY_HOST}"
+export https_proxy="http://${ARTEX_PROXY_HOST}"
+export all_proxy="socks5://${ARTEX_PROXY_HOST}"
+export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy" ALL_PROXY="$all_proxy"
+export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="$no_proxy"
+
 # 后端（普通 go run，不内嵌前端）；并发 work agent 数在「系统设置」里配置。
 go run ./cmd/artex -addr :8787 -proxy 127.0.0.1:8788 &
 

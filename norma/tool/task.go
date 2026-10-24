@@ -70,9 +70,9 @@ type Task struct {
 	OutputPath  string
 
 	// internal, guarded by Manager.mu
-	backgrounded bool          // surfaced as a background task: notify on exit
-	notified     bool          // completion already enqueued into pending
-	oversize     bool          // terminated by the size watchdog
+	backgrounded bool // surfaced as a background task: notify on exit
+	notified     bool // completion already enqueued into pending
+	oversize     bool // terminated by the size watchdog
 	cmd          *exec.Cmd
 	done         chan struct{} // closed by watch when the process exits
 }
@@ -88,15 +88,15 @@ func (t *Task) info() TaskInfo {
 
 // TaskInfo is an immutable snapshot of a task for safe reads outside the lock.
 type TaskInfo struct {
-	ID          string
-	Kind        TaskKind
-	Command     string
-	Description string
-	Status      TaskStatus
-	ExitCode    int
-	StartTime   time.Time
-	EndTime     time.Time
-	OutputPath  string
+	ID           string
+	Kind         TaskKind
+	Command      string
+	Description  string
+	Status       TaskStatus
+	ExitCode     int
+	StartTime    time.Time
+	EndTime      time.Time
+	OutputPath   string
 	Backgrounded bool
 }
 
@@ -137,11 +137,39 @@ type SpawnSpec struct {
 // "KEY=VALUE" entries, or nil when extra is empty (child inherits unchanged).
 // os/exec dedups by key — case-insensitive on Windows, keeping the LAST
 // occurrence — so the appended entries override inherited ones on every OS.
+// withEnv layers extra KEY=VALUE pairs over the inherited environment.
+//
+// It must REPLACE same-named variables rather than append them: getenv() returns
+// the FIRST match, so appending leaves the parent's value in effect. That bit us
+// for real — the platform runs with HTTPS_PROXY=<global proxy>, so an agent whose
+// egress was Tor still resolved HTTPS_PROXY to the global proxy and every curl
+// bypassed Tor silently.
 func withEnv(extra []string) []string {
 	if len(extra) == 0 {
 		return nil
 	}
-	return append(os.Environ(), extra...)
+	overridden := make(map[string]bool, len(extra))
+	keys := make([]string, 0, len(extra))
+	for _, kv := range extra {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			k := kv[:i]
+			if !overridden[k] {
+				overridden[k] = true
+				keys = append(keys, k)
+			}
+		}
+	}
+	base := os.Environ()
+	out := make([]string, 0, len(base)+len(extra))
+	for _, kv := range base {
+		i := strings.IndexByte(kv, '=')
+		if i > 0 && overridden[kv[:i]] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	out = append(out, extra...)
+	return out
 }
 
 // Manager owns the background tasks of one Session.

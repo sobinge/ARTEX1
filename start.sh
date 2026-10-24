@@ -20,6 +20,21 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 
+# —— 出网代理 env（显式固定，重启/换终端/被服务拉起都不会丢）————————————
+# 取值与「系统设置 → 全局出口代理」(socks5://127.0.0.1:7897) 保持一致；
+# 依赖默认 transport 的组件(MCP-http、web_search、各类 Go 默认 HTTP 客户端)
+# 会读取这些变量，从而一并走全局代理。端口如需改动：启动前设 ARTEX_PROXY_HOST=host:port。
+ARTEX_PROXY_HOST="${ARTEX_PROXY_HOST:-127.0.0.1:7897}"
+export http_proxy="http://${ARTEX_PROXY_HOST}"
+export https_proxy="http://${ARTEX_PROXY_HOST}"
+export all_proxy="socks5://${ARTEX_PROXY_HOST}"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+export ALL_PROXY="$all_proxy"
+# 回环直连：平台自身 API / MITM(:8788) / DB 不走代理，避免自环。
+export no_proxy="localhost,127.0.0.1,::1"
+export NO_PROXY="$no_proxy"
+
 BIN=./artex
 [ -x "$BIN" ] || { echo "[artex] 找不到可执行文件 $BIN" >&2; exit 1; }
 
