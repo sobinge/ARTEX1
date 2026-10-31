@@ -1,0 +1,11 @@
+# 无订阅时的最小可用配置：本地混合入站（HTTP+SOCKS）只绑回环，全部直连。
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+external-controller: 127.0.0.1:9090
+mode: rule
+log-level: warning
+proxies: []
+proxy-groups: []
+rules:
+  - MATCH,DIRECT

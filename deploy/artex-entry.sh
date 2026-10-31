@@ -1,21 +1,31 @@
 #!/bin/sh
-# 容器入口：把容器内**全部**出站流量强制进 Tor（透明代理）。
+# 容器入口：把容器内**全部**出站流量强制进 Tor（透明代理），并保留两条例外：
+#   1) tor 自身（uid artestor）
+#   2) Clash（uid clash）—— Tor 出口被目标/网络拦截时，测试需要临时用 Clash 走别的出口；
+#      Clash 的上游连接若被 Tor 劫持就失去意义，因此按 uid 放行。
+# 规则：
 #   - TCP  : nat OUTPUT REDIRECT -> 127.0.0.1:9040  (tor TransPort)
 #   - DNS  : udp/tcp 53            -> 127.0.0.1:19053 (tor DNSPort)
 #   - 其它 : UDP/ICMP 直接丢弃（Tor 不承载 UDP，宁可失败也不真实出网）
-# 放行：tor 自身（独立 uid artestor）、loopback、容器内网、已建立连接（含本容器
-#       对外提供服务的回包）。
+# 放行：上两条 uid、直连白名单(ARTEX_DIRECT_IPS)、loopback、容器内网、已建立连接。
 # 需要 NET_ADMIN。排障可用 ARTEX_TRANSPARENT_TOR=0 关闭。
 set -u
 
 TOR_UID="$(id -u artestor 2>/dev/null || echo '')"
+CLASH_UID="$(id -u clash 2>/dev/null || echo '')"
 
 install_rules() {
   command -v iptables >/dev/null 2>&1 || return 1
 
   iptables -t nat -N ARTEX_TP 2>/dev/null || true
   iptables -t nat -F ARTEX_TP || return 1
-  # DNS 必须先匹配：否则会被下面的 loopback RETURN 放行回系统解析器
+  # uid 例外必须在 DNS/端口重定向前，否则它们自己的 DNS 也会被劫持
+  if [ -n "$CLASH_UID" ]; then
+    iptables -t nat -A ARTEX_TP -m owner --uid-owner "$CLASH_UID" -j RETURN || return 1
+  fi
+  if [ -n "$TOR_UID" ]; then
+    iptables -t nat -A ARTEX_TP -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
+  fi
   iptables -t nat -A ARTEX_TP -p udp --dport 53 -j REDIRECT --to-ports 19053 || return 1
   iptables -t nat -A ARTEX_TP -p tcp --dport 53 -j REDIRECT --to-ports 19053 || return 1
   iptables -t nat -A ARTEX_TP -o lo -j RETURN || return 1
@@ -23,23 +33,23 @@ install_rules() {
   iptables -t nat -A ARTEX_TP -d 172.16.0.0/12 -j RETURN || return 1
   iptables -t nat -A ARTEX_TP -d 10.0.0.0/8 -j RETURN || return 1
   iptables -t nat -A ARTEX_TP -d 192.168.0.0/16 -j RETURN || return 1
-  if [ -n "$TOR_UID" ]; then
-    iptables -t nat -A ARTEX_TP -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
-  fi
   iptables -t nat -A ARTEX_TP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
   iptables -t nat -A ARTEX_TP -p tcp -j REDIRECT --to-ports 9040 || return 1
   iptables -t nat -C OUTPUT -j ARTEX_TP 2>/dev/null || iptables -t nat -A OUTPUT -j ARTEX_TP || return 1
 
   iptables -N ARTEX_DROP 2>/dev/null || true
   iptables -F ARTEX_DROP || return 1
+  if [ -n "$CLASH_UID" ]; then
+    iptables -A ARTEX_DROP -m owner --uid-owner "$CLASH_UID" -j RETURN || return 1
+  fi
+  if [ -n "$TOR_UID" ]; then
+    iptables -A ARTEX_DROP -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
+  fi
   iptables -A ARTEX_DROP -o lo -j RETURN || return 1
   iptables -A ARTEX_DROP -d 127.0.0.0/8 -j RETURN || return 1
   iptables -A ARTEX_DROP -d 172.16.0.0/12 -j RETURN || return 1
   iptables -A ARTEX_DROP -d 10.0.0.0/8 -j RETURN || return 1
   iptables -A ARTEX_DROP -d 192.168.0.0/16 -j RETURN || return 1
-  if [ -n "$TOR_UID" ]; then
-    iptables -A ARTEX_DROP -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
-  fi
   iptables -A ARTEX_DROP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
   iptables -A ARTEX_DROP -p tcp -j RETURN || return 1
   iptables -A ARTEX_DROP -p udp -j DROP || return 1
@@ -48,8 +58,8 @@ install_rules() {
   return 0
 }
 
-# 直连白名单：大模型/平台自身走真实出口（Tor 出口常被模型厂商封，且 Tor DNS 对
-# 部分域名会 SERVFAIL）。域名由 compose 的 extra_hosts 固定，这里只放行目标 IP。
+# 直连白名单：大模型/平台自身走真实出口（Tor 出口常被厂商封，且 Tor DNS 对部分域名
+# 会 SERVFAIL）。域名由 compose 的 extra_hosts 固定，这里只放行目标 IP。
 apply_direct_ips() {
   for ip in ${ARTEX_DIRECT_IPS:-}; do
     iptables -t nat -I ARTEX_TP 1 -d "$ip" -m comment --comment artex-direct -j RETURN 2>/dev/null || return 1
@@ -59,7 +69,18 @@ apply_direct_ips() {
   return 0
 }
 
-# 供宿主机定时刷新直连白名单时复用（只重装规则，不启动应用）
+# Clash 常驻（有配置才启动；无订阅时用 /etc/mihomo/base.yaml 的直连配置占位）
+start_clash() {
+  [ -x /usr/local/bin/mihomo ] || return 0
+  [ -n "$CLASH_UID" ] || return 0
+  mkdir -p /app/data/clash
+  if [ ! -f /app/data/clash/config.yaml ]; then
+    cp /etc/mihomo/base.yaml /app/data/clash/config.yaml 2>/dev/null || return 0
+  fi
+  /usr/local/bin/artex-clash-restart.sh || true
+}
+
+# 供宿主机定时刷新/重装规则时复用（只重装规则，不启动应用）
 if [ "${1:-}" = "--refresh-rules" ]; then
   if install_rules; then
     apply_direct_ips
@@ -73,6 +94,7 @@ if [ "${ARTEX_TRANSPARENT_TOR:-1}" = "0" ]; then
 elif install_rules; then
   echo "[entry] 全流量透明代理已启用: TCP->TransPort 9040, DNS->DNSPort 19053, UDP/ICMP 丢弃"
   apply_direct_ips || echo "[entry] 警告: 直连白名单规则安装失败" >&2
+  start_clash
 else
   echo "[entry] 警告: 透明代理规则安装失败（缺 NET_ADMIN/iptables）" >&2
 fi
