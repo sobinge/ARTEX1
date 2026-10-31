@@ -330,9 +330,14 @@ server {
 - tor 以独立用户 `artestor` 运行，iptables 用 `-m owner --uid-owner` 放行 tor 自身流量，避免自套成环；
 - 放行 loopback / 容器内网 / 已建立连接，`8787`、`8788` 的对外服务与 PostgreSQL 不受影响。
 
+**大模型等平台自身出网必须直连**：Tor 出口常被模型厂商封禁，且 tor `DNSPort` 对部分域名会
+`SERVFAIL`（应用日志表现为 `lookup api.deepseek.com on 127.0.0.1:53: server misbehaving`）。
+因此提供直连白名单：`ARTEX_DIRECT_IPS`（目标 IP，逗号/空格分隔）+ compose 的 `extra_hosts`
+固定域名解析（`ARTEX_LLM_IP`），命中的目标绕过 Tor，其余仍然强制走 Tor。
+
 取舍：透明转发的流量统一走 slot 1 的出口（SOCKS 的 per-Agent 分槽仍可用）；UDP 工具（含 QUIC/HTTP3）
 会失败而不是泄漏；`ARTEX_TRANSPARENT_TOR=0` 可临时关闭排障。tor `DNSPort` 只实现了 A/AAAA/PTR，
-`TXT/MX/NS/SRV` 查询会返回 `NOTIMP`。
+`TXT/MX/NS/SRV` 查询会返回 `NOTIMP`。直连白名单按 IP 生效，模型端点换 IP 时需要同步更新。
 
 ### 「配了 Tor 却还是真实 IP」——已修的四个坑
 

@@ -48,10 +48,22 @@ install_rules() {
   return 0
 }
 
+# 直连白名单：大模型/平台自身走真实出口（Tor 出口常被模型厂商封，且 Tor DNS 对
+# 部分域名会 SERVFAIL）。域名由 compose 的 extra_hosts 固定，这里只放行目标 IP。
+apply_direct_ips() {
+  for ip in ${ARTEX_DIRECT_IPS:-}; do
+    iptables -t nat -I ARTEX_TP 1 -d "$ip" -j RETURN 2>/dev/null || return 1
+    iptables -I ARTEX_DROP 1 -d "$ip" -j RETURN 2>/dev/null || return 1
+    echo "[entry] 直连白名单: $ip"
+  done
+  return 0
+}
+
 if [ "${ARTEX_TRANSPARENT_TOR:-1}" = "0" ]; then
   echo "[entry] ARTEX_TRANSPARENT_TOR=0，跳过透明代理规则" >&2
 elif install_rules; then
   echo "[entry] 全流量透明代理已启用: TCP->TransPort 9040, DNS->DNSPort 19053, UDP/ICMP 丢弃"
+  apply_direct_ips || echo "[entry] 警告: 直连白名单规则安装失败" >&2
 else
   echo "[entry] 警告: 透明代理规则安装失败（缺 NET_ADMIN/iptables）" >&2
 fi

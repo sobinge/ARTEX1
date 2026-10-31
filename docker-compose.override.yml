@@ -14,6 +14,13 @@ services:
       dockerfile: Dockerfile.tor
     extra_hosts:
       - "postgres:172.18.0.3"
+      # 大模型端点固定解析：容器内 DNS 已全部走 Tor，而 Tor DNS 对部分域名
+      # 会 SERVERFAIL；这里用 /etc/hosts 固定 IP，配合下面的直连白名单使用。
+      # 换 IP 时改 .env 的 ARTEX_LLM_IP（或直接改此处）。
+      - "api.deepseek.com:${ARTEX_LLM_IP:-3.173.21.63}"
+    environment:
+      # 逗号/空格分隔的直连目标 IP（大模型、第三方情报 API 等），其余流量强制 Tor
+      ARTEX_DIRECT_IPS: "${ARTEX_LLM_IP:-3.173.21.63}"
     # 入口脚本要在容器 netns 里装 DNS 重定向规则（见 deploy/artex-entry.sh）
     cap_add:
       - NET_ADMIN
