@@ -339,6 +339,22 @@ server {
 会失败而不是泄漏；`ARTEX_TRANSPARENT_TOR=0` 可临时关闭排障。tor `DNSPort` 只实现了 A/AAAA/PTR，
 `TXT/MX/NS/SRV` 查询会返回 `NOTIMP`。直连白名单按 IP 生效，模型端点换 IP 时需要同步更新。
 
+### 临时换出口：内置 Clash(mihomo)
+
+Tor 出口有时会被目标或网络拦截，测试需要临时换一条出口。镜像内置 mihomo（Clash.Meta），
+以独立用户 `clash`（uid 912）运行，并在 iptables 中**按 uid 豁免**——否则 Clash 自己的上游
+连接也会被容器的透明 Tor 劫持，Tor 被封时等于不可用。其它流量的 Tor 规则不变。
+
+- 本地入站：`mixed-port 127.0.0.1:7890`（HTTP + SOCKS 同一端口），控制口 `127.0.0.1:9090`，
+  均只绑回环；DNS 用 mihomo 内置 DoH（`127.0.0.1:1053`），不依赖系统 resolver。
+- 工具临时改走 Clash：`export ALL_PROXY=socks5h://127.0.0.1:7890`，或 `curl -x http://127.0.0.1:7890`。
+- 下发订阅（**在宿主机执行**，容器内下载会走 Tor，订阅站多封 Tor）：
+  ```bash
+  cd /opt/ARTEX1 && ./deploy/clash-set-subscription.sh '<订阅URL>'
+  ```
+  脚本会丢弃订阅自带的入站/控制器/dns 配置，强制回环绑定并注入内置 DoH，然后热重启 mihomo。
+- 无订阅时使用 `/etc/mihomo/base.yaml`（全部直连）占位，`mixed-port` 也能用来验证连通性。
+
 ### 「配了 Tor 却还是真实 IP」——已修的四个坑
 
 都是实测中被外部观测点的日志抓出来的，不是推测：
