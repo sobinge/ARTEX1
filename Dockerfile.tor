@@ -1,10 +1,12 @@
-# 运行镜像叠加 tor 可执行文件 + DNS 垫片。
+# 运行镜像叠加 tor + 全流量透明代理。
 #
 # 为什么需要：
 #   - ARTEX 的目标流量默认经 Tor 出口（tools.egress_class=target-probe 时 fail-closed），
 #     而 runtime 阶段未预装 tor；
-#   - tor 的 DNSPort 只支持 A/AAAA/PTR，这里让 slot1 额外在 127.0.0.1:53 提供 DNS，
-#     容器 /etc/resolv.conf 指向它，避免域名解析泄漏到本地解析器。
+#   - 光靠代理环境变量覆盖不到 nmap/dig 这类工具，因此在容器 netns 里做透明代理：
+#     TCP -> tor TransPort(9040)，DNS -> tor DNSPort(19053)，其余 UDP/ICMP 丢弃。
+#   - tor 以独立用户 artestor 运行，iptables 用 owner 匹配放行 tor 自身流量，避免成环；
+#     deploy/tor-shim.sh 负责 chown 实例目录并追加 TransPort/DNSPort/User 参数。
 #
 # 先构建源码镜像，再构建本文件：
 #   docker build -t artex-src:local -f Dockerfile .
@@ -14,7 +16,8 @@ ARG BASE=artex-src:local
 FROM ${BASE}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends tor iptables \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -r -u 910 -M -s /usr/sbin/nologin artestor
 COPY deploy/tor-shim.sh /usr/sbin/tor-shim.sh
 RUN chmod 755 /usr/sbin/tor-shim.sh \
  && mv /usr/sbin/tor /usr/sbin/tor.real \

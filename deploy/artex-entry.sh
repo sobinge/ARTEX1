@@ -1,25 +1,59 @@
 #!/bin/sh
-# 容器入口：先把容器内**所有** DNS（含工具自己指定的 8.8.8.8 / 1.1.1.1 / --dns-servers，
-# 以及忽略 /etc/resolv.conf 的实现）在 netfilter 层重定向到 Tor 的 DNSPort，
-# 再启动应用。需要 NET_ADMIN；规则装不上只告警，不阻止启动。
+# 容器入口：把容器内**全部**出站流量强制进 Tor（透明代理）。
+#   - TCP  : nat OUTPUT REDIRECT -> 127.0.0.1:9040  (tor TransPort)
+#   - DNS  : udp/tcp 53            -> 127.0.0.1:19053 (tor DNSPort)
+#   - 其它 : UDP/ICMP 直接丢弃（Tor 不承载 UDP，宁可失败也不真实出网）
+# 放行：tor 自身（独立 uid artestor）、loopback、容器内网、已建立连接（含本容器
+#       对外提供服务的回包）。
+# 需要 NET_ADMIN。排障可用 ARTEX_TRANSPARENT_TOR=0 关闭。
 set -u
 
-install_dns_redirect() {
+TOR_UID="$(id -u artestor 2>/dev/null || echo '')"
+
+install_rules() {
   command -v iptables >/dev/null 2>&1 || return 1
-  iptables -t nat -N ARTEX_DNS 2>/dev/null || true
-  iptables -t nat -F ARTEX_DNS 2>/dev/null || return 1
-  # 指向 Tor DNSPort 自身的流量不能再次重定向，否则成环
-  iptables -t nat -A ARTEX_DNS -d 127.0.0.1/32 -j RETURN || return 1
-  iptables -t nat -A ARTEX_DNS -p udp --dport 53 -j REDIRECT --to-ports 53 || return 1
-  iptables -t nat -A ARTEX_DNS -p tcp --dport 53 -j REDIRECT --to-ports 53 || return 1
-  iptables -t nat -C OUTPUT -j ARTEX_DNS 2>/dev/null || iptables -t nat -A OUTPUT -j ARTEX_DNS || return 1
+
+  iptables -t nat -N ARTEX_TP 2>/dev/null || true
+  iptables -t nat -F ARTEX_TP || return 1
+  # DNS 必须先匹配：否则会被下面的 loopback RETURN 放行回系统解析器
+  iptables -t nat -A ARTEX_TP -p udp --dport 53 -j REDIRECT --to-ports 19053 || return 1
+  iptables -t nat -A ARTEX_TP -p tcp --dport 53 -j REDIRECT --to-ports 19053 || return 1
+  iptables -t nat -A ARTEX_TP -o lo -j RETURN || return 1
+  iptables -t nat -A ARTEX_TP -d 127.0.0.0/8 -j RETURN || return 1
+  iptables -t nat -A ARTEX_TP -d 172.16.0.0/12 -j RETURN || return 1
+  iptables -t nat -A ARTEX_TP -d 10.0.0.0/8 -j RETURN || return 1
+  iptables -t nat -A ARTEX_TP -d 192.168.0.0/16 -j RETURN || return 1
+  if [ -n "$TOR_UID" ]; then
+    iptables -t nat -A ARTEX_TP -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
+  fi
+  iptables -t nat -A ARTEX_TP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
+  iptables -t nat -A ARTEX_TP -p tcp -j REDIRECT --to-ports 9040 || return 1
+  iptables -t nat -C OUTPUT -j ARTEX_TP 2>/dev/null || iptables -t nat -A OUTPUT -j ARTEX_TP || return 1
+
+  iptables -N ARTEX_DROP 2>/dev/null || true
+  iptables -F ARTEX_DROP || return 1
+  iptables -A ARTEX_DROP -o lo -j RETURN || return 1
+  iptables -A ARTEX_DROP -d 127.0.0.0/8 -j RETURN || return 1
+  iptables -A ARTEX_DROP -d 172.16.0.0/12 -j RETURN || return 1
+  iptables -A ARTEX_DROP -d 10.0.0.0/8 -j RETURN || return 1
+  iptables -A ARTEX_DROP -d 192.168.0.0/16 -j RETURN || return 1
+  if [ -n "$TOR_UID" ]; then
+    iptables -A ARTEX_DROP -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
+  fi
+  iptables -A ARTEX_DROP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
+  iptables -A ARTEX_DROP -p tcp -j RETURN || return 1
+  iptables -A ARTEX_DROP -p udp -j DROP || return 1
+  iptables -A ARTEX_DROP -p icmp -j DROP || return 1
+  iptables -C OUTPUT -j ARTEX_DROP 2>/dev/null || iptables -A OUTPUT -j ARTEX_DROP || return 1
   return 0
 }
 
-if install_dns_redirect; then
-  echo "[entry] DNS 已重定向到 Tor DNSPort (127.0.0.1:53)"
+if [ "${ARTEX_TRANSPARENT_TOR:-1}" = "0" ]; then
+  echo "[entry] ARTEX_TRANSPARENT_TOR=0，跳过透明代理规则" >&2
+elif install_rules; then
+  echo "[entry] 全流量透明代理已启用: TCP->TransPort 9040, DNS->DNSPort 19053, UDP/ICMP 丢弃"
 else
-  echo "[entry] 警告: DNS 重定向规则安装失败（缺 NET_ADMIN 或 iptables）" >&2
+  echo "[entry] 警告: 透明代理规则安装失败（缺 NET_ADMIN/iptables）" >&2
 fi
 
 exec /app/start.sh "$@"
