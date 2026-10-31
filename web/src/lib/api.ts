@@ -266,6 +266,8 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
+    egressMode?: "inherit" | "tor" | "proxy" | "direct";
+    egressProxy?: string;
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -280,9 +282,14 @@ export const api = {
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
+      egress_mode: input.egressMode ?? "", // 任务级出口覆盖：""=继承 Agent
+      egress_proxy: input.egressProxy ?? "", // egress_mode=proxy 时的代理地址（如 Clash 的 127.0.0.1:7890）
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
+  // 设置任务级出口覆盖（mode: inherit/tor/proxy/direct；proxy 时填 proxy）
+  setTaskEgress: (id: string, mode: string, proxy = "") =>
+    put<{ ok: boolean; egress_mode: string; egress_proxy: string }>(`/tasks/${id}/egress`, { mode, proxy }),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),

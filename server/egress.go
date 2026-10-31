@@ -2,7 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -194,6 +198,10 @@ func (s *Server) resolveEgress(a *db.Agent, taskID string) (EgressPlan, error) {
 		agentKey = a.Key
 		mode, proxy, country, circuitKey = a.EgressMode, a.EgressProxy, a.TorExitCountry, a.TorCircuitKey
 	}
+	// 任务级覆盖优先于 Agent 策略：让「某一个任务临时走 Clash、其余仍走 Tor」成立。
+	if tm, tp := s.taskEgressOverride(taskID); tm != "" {
+		mode, proxy = tm, tp
+	}
 	if mode == "" || mode == "inherit" {
 		if gp := strings.TrimSpace(s.m.GlobalProxy()); gp != "" {
 			plan := EgressPlan{Mode: "proxy", ProxyURL: gp}
@@ -357,4 +365,87 @@ func (s *Server) beginEgressAudit(taskID, agentKey string) func(error) {
 			_ = s.m.pg.FinishEgressRun(id, p.IP, p.IsTor, user)
 		}()
 	}
+}
+
+// taskEgressOverride returns the task-level egress override, if any.
+// Empty mode means "inherit" (no override).
+func (s *Server) taskEgressOverride(taskID string) (mode, proxy string) {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return "", ""
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(taskID), 10, 64)
+	if err != nil || id <= 0 {
+		return "", ""
+	}
+	m, p, err := s.m.pg.TaskEgress(id)
+	if err != nil {
+		return "", ""
+	}
+	m = strings.TrimSpace(m)
+	if m == "" || m == "inherit" {
+		return "", ""
+	}
+	return m, strings.TrimSpace(p)
+}
+
+// validTaskEgress normalises and validates a task-level egress override.
+func validTaskEgress(mode, proxy string) (string, string, error) {
+	mode = strings.TrimSpace(mode)
+	proxy = strings.TrimSpace(proxy)
+	switch mode {
+	case "", "inherit":
+		return "inherit", "", nil
+	case "tor", "direct":
+		return mode, "", nil
+	case "proxy":
+		if proxy == "" {
+			return "", "", fmt.Errorf("egress_mode=proxy 需要填写代理地址")
+		}
+		lower := strings.ToLower(proxy)
+		ok := strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") ||
+			strings.HasPrefix(lower, "socks5://") || strings.HasPrefix(lower, "socks5h://")
+		if !ok {
+			return "", "", fmt.Errorf("代理地址需以 http:// / https:// / socks5:// / socks5h:// 开头")
+		}
+		return mode, proxy, nil
+	default:
+		return "", "", fmt.Errorf("egress_mode 需为 inherit/tor/proxy/direct")
+	}
+}
+
+// PUT /api/tasks/{id}/egress — 设置任务级出口覆盖（不影响其它任务）。
+func (s *Server) putTaskEgress(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(strings.TrimSpace(idStr), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, 400, "任务 id 无效")
+		return
+	}
+	if _, ok := s.m.Task(idStr); !ok {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	var req struct {
+		Mode  string `json:"mode"`
+		Proxy string `json:"proxy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "bad json: "+err.Error())
+		return
+	}
+	mode, proxy, err := validTaskEgress(req.Mode, req.Proxy)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if s.m.pg == nil {
+		writeErr(w, 503, "数据库不可用")
+		return
+	}
+	if err := s.m.pg.SetTaskEgress(id, mode, proxy); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	log.Printf("[task] #%d 出口覆盖: mode=%s proxy=%s", id, mode, proxy)
+	writeJSON(w, 200, map[string]any{"ok": true, "egress_mode": mode, "egress_proxy": proxy})
 }
