@@ -133,3 +133,38 @@ func TestCanonicalEgressAgent(t *testing.T) {
 		}
 	}
 }
+
+func TestValidTaskEgress(t *testing.T) {
+	cases := []struct {
+		mode, proxy string
+		wantMode    string
+		wantProxy   string
+		wantErr     bool
+	}{
+		{"", "", "inherit", "", false},
+		{"inherit", "http://127.0.0.1:7890", "inherit", "", false},
+		{"tor", "", "tor", "", false},
+		{"direct", "", "direct", "", false},
+		{"proxy", "http://127.0.0.1:7890", "proxy", "http://127.0.0.1:7890", false},
+		{"proxy", "socks5h://127.0.0.1:7890", "proxy", "socks5h://127.0.0.1:7890", false},
+		{"proxy", "", "", "", true},
+		{"proxy", "127.0.0.1:7890", "", "", true},
+		{"bogus", "", "", "", true},
+	}
+	for _, c := range cases {
+		mode, proxy, err := validTaskEgress(c.mode, c.proxy)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("validTaskEgress(%q,%q) = (%q,%q,nil), want error", c.mode, c.proxy, mode, proxy)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("validTaskEgress(%q,%q) unexpected error: %v", c.mode, c.proxy, err)
+			continue
+		}
+		if mode != c.wantMode || proxy != c.wantProxy {
+			t.Errorf("validTaskEgress(%q,%q) = (%q,%q), want (%q,%q)", c.mode, c.proxy, mode, proxy, c.wantMode, c.wantProxy)
+		}
+	}
+}
