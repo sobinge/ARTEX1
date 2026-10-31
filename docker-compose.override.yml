@@ -1,16 +1,29 @@
 # 本地从源码构建并叠加 tor（见 Dockerfile.tor / rebuild-local.sh）。
 # 发布端口只做端口映射，来源限制交给宿主机防火墙（Docker 发布端口会绕过 ufw）。
 services:
+  postgres:
+    networks:
+      default:
+        # 固定 IP：artex 的 /etc/resolv.conf 已指向 Tor（127.0.0.1:53），
+        # 容器名 postgres 改由 extra_hosts 提供，不再经过 Docker 内嵌 DNS。
+        ipv4_address: 172.18.0.3
   artex:
     image: artex-tor:local
     build:
       context: .
       dockerfile: Dockerfile.tor
+    extra_hosts:
+      - "postgres:172.18.0.3"
     ports: !override
       - "8787:8787"
       - "127.0.0.1:8788:8788"
     volumes:
       # JWT 签名密钥持久化，避免容器重建后所有人被登出。
-      # 首次使用前该文件必须存在（rebuild-local.sh 会自动 touch），
-      # 否则 Docker 会把它创建成目录。
       - ./data/jwt.key:/app/jwt.key
+      # DNS 走 Tor：slot1 的 DNSPort 监听 127.0.0.1:53（见 deploy/tor-shim.sh）
+      - ./deploy/resolv.conf:/etc/resolv.conf:ro
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
