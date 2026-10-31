@@ -30,7 +30,7 @@ services:
     volumes:
       # JWT 签名密钥持久化，避免容器重建后所有人被登出。
       - ./data/jwt.key:/app/jwt.key
-      # DNS 走 Tor：slot1 的 DNSPort 监听 127.0.0.1:53（见 deploy/tor-shim.sh）
+      # DNS 重定向到 slot1 的 DNSPort 19053（见 deploy/artex-entry.sh + tor-shim.sh）
       - ./deploy/resolv.conf:/etc/resolv.conf:ro
 networks:
   default:

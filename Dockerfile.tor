@@ -4,7 +4,8 @@
 #   - ARTEX 的目标流量默认经 Tor 出口（tools.egress_class=target-probe 时 fail-closed），
 #     而 runtime 阶段未预装 tor；
 #   - 光靠代理环境变量覆盖不到 nmap/dig 这类工具，因此在容器 netns 里做透明代理：
-#     TCP -> tor TransPort(9040)，DNS -> tor DNSPort(19053)，其余 UDP/ICMP 丢弃。
+#     TCP -> tor TransPort(9040)，DNS(53) -> tor DNSPort(19053)，其余 UDP/ICMP 丢弃；
+#     模型等平台自身出网通过 ARTEX_DIRECT_IPS 白名单直连（见 deploy/artex-entry.sh）。
 #   - tor 以独立用户 artestor 运行，iptables 用 owner 匹配放行 tor 自身流量，避免成环；
 #     deploy/tor-shim.sh 负责 chown 实例目录并追加 TransPort/DNSPort/User 参数。
 #
