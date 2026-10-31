@@ -52,8 +52,8 @@ install_rules() {
 # 部分域名会 SERVFAIL）。域名由 compose 的 extra_hosts 固定，这里只放行目标 IP。
 apply_direct_ips() {
   for ip in ${ARTEX_DIRECT_IPS:-}; do
-    iptables -t nat -I ARTEX_TP 1 -d "$ip" -j RETURN 2>/dev/null || return 1
-    iptables -I ARTEX_DROP 1 -d "$ip" -j RETURN 2>/dev/null || return 1
+    iptables -t nat -I ARTEX_TP 1 -d "$ip" -m comment --comment artex-direct -j RETURN 2>/dev/null || return 1
+    iptables -I ARTEX_DROP 1 -d "$ip" -m comment --comment artex-direct -j RETURN 2>/dev/null || return 1
     echo "[entry] 直连白名单: $ip"
   done
   return 0

@@ -20,7 +20,15 @@ for h in $HOSTS; do
     for ip in "$@"; do printf "%s\t%s\n" "$ip" "$h" >> "$tmp"; done
     cat "$tmp" > /etc/hosts
   ' sh "$h" $ips || continue
+  want=$(printf '%s\n' $ips | sort -u | tr '\n' ' ')
+  cur=$(docker exec "$CONTAINER" sh -c \
+    "iptables -t nat -S ARTEX_TP 2>/dev/null | sed -n 's/.*-d \\([0-9.]*\\)\\/32 -m comment --comment artex-direct.*/\\1/p'" \
+    | sort -u | tr '\n' ' ')
+  if [ "$want" = "$cur" ]; then
+    echo "[refresh] $h 直连规则无变化，跳过（避免无谓重建链）"
+    continue
+  fi
   docker exec -e ARTEX_DIRECT_IPS="$ips" "$CONTAINER" \
     /usr/local/bin/artex-entry.sh --refresh-rules >/dev/null 2>&1 \
-    && echo "[refresh] $h 直连规则已同步"
+    && echo "[refresh] $h 直连规则已同步: $want"
 done
