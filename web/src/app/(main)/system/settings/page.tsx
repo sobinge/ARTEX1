@@ -39,7 +39,7 @@ export default function SystemSettingsPage() {
   const [savingTor, setSavingTor] = React.useState(false);
   // Tor 实例池（每 Agent 独立出口）
   const [poolEnabled, setPoolEnabled] = React.useState(false);
-  const [poolSize, setPoolSize] = React.useState("3");
+  const [poolSize, setPoolSize] = React.useState("5");
   const [poolSocksBase, setPoolSocksBase] = React.useState("19050");
   const [poolControlBase, setPoolControlBase] = React.useState("19150");
   const [poolDir, setPoolDir] = React.useState("");
@@ -82,7 +82,7 @@ export default function SystemSettingsPage() {
     if (s.tor_pool_control_base) setPoolControlBase(String(s.tor_pool_control_base));
     if (s.tor_pool_status) {
       setPoolStatus(s.tor_pool_status);
-      setPoolSize(String(s.tor_pool_size || s.tor_pool_status.size || 3));
+      setPoolSize(String(s.tor_pool_size || s.tor_pool_status.size || 5));
       setPoolDir(s.tor_pool_status.dir ?? "");
       setPoolBinary(s.tor_pool_status.binary ?? "tor");
     }

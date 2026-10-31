@@ -932,7 +932,7 @@ torpool.Pool
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `tor_pool_enabled` | false | 开启后启用池；关闭时用单 daemon |
-| `tor_pool_size` | 3 | 实例数（1..32） |
+| `tor_pool_size` | 5 | 实例数（1..32） |
 | `tor_pool_socks_base` | 19050 | 槽位 1 的 SOCKS 端口 |
 | `tor_pool_control_base` | 19150 | 槽位 1 的控制口 |
 | `tor_pool_dir` | `<dataDir>/torpool` | 每槽位子目录根 |

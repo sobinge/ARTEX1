@@ -501,8 +501,8 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if v, ok, _ := pg.GetSetting(settingTorCookiePath); ok {
 		m.torCookiePath = strings.TrimSpace(v)
 	}
-	// Tor pool defaults mirror the design doc: 3 daemons, ports 19050+/19150+.
-	m.torPoolSize = 3
+	// Tor pool defaults mirror the design doc: 5 daemons, ports 19050+/19150+.
+	m.torPoolSize = 5
 	m.torPoolSocksBase = 19050
 	m.torPoolControlBase = 19150
 	m.torBinary = "tor"
