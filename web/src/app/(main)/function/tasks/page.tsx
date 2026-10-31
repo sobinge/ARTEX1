@@ -3157,7 +3157,7 @@ function CreateTaskSheet({
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
-        egressMode: egressMode === "inherit" ? "" : egressMode,
+        egressMode,
         egressProxy: egressMode === "proxy" ? egressProxy.trim() : "",
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
