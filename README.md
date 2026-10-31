@@ -319,6 +319,21 @@ server {
 
 > runtime 里的 slot 名（如 `work#3`）在审计前会归一化成 `worker`，否则同一 Agent 会因 key 漂移出现「refused」假阳性。
 
+### 全流量透明代理（容器内，可选）
+
+上面的出口策略依赖代理环境变量 + 执行层拒绝，覆盖不到 `nmap`/`dig` 这类不读代理、或自己指定
+解析器的工具。仓库内置一套容器级透明代理（`deploy/artex-entry.sh` + `deploy/tor-shim.sh`），
+由 `Dockerfile.tor` 打进镜像，`docker-compose.override.yml` 授予 `NET_ADMIN`：
+
+- `nat OUTPUT`：TCP 全量 `REDIRECT` 到 tor `TransPort(9040)`；`udp/tcp 53` 重定向到 `DNSPort(19053)`；
+- `filter OUTPUT`：其余 UDP/ICMP 直接丢弃（Tor 不承载 UDP，宁可失败也不真实出网）；
+- tor 以独立用户 `artestor` 运行，iptables 用 `-m owner --uid-owner` 放行 tor 自身流量，避免自套成环；
+- 放行 loopback / 容器内网 / 已建立连接，`8787`、`8788` 的对外服务与 PostgreSQL 不受影响。
+
+取舍：透明转发的流量统一走 slot 1 的出口（SOCKS 的 per-Agent 分槽仍可用）；UDP 工具（含 QUIC/HTTP3）
+会失败而不是泄漏；`ARTEX_TRANSPARENT_TOR=0` 可临时关闭排障。tor `DNSPort` 只实现了 A/AAAA/PTR，
+`TXT/MX/NS/SRV` 查询会返回 `NOTIMP`。
+
 ### 「配了 Tor 却还是真实 IP」——已修的四个坑
 
 都是实测中被外部观测点的日志抓出来的，不是推测：
