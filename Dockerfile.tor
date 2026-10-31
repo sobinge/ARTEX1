@@ -13,10 +13,14 @@
 ARG BASE=artex-src:local
 FROM ${BASE}
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tor \
+ && apt-get install -y --no-install-recommends tor iptables \
  && rm -rf /var/lib/apt/lists/*
 COPY deploy/tor-shim.sh /usr/sbin/tor-shim.sh
 RUN chmod 755 /usr/sbin/tor-shim.sh \
  && mv /usr/sbin/tor /usr/sbin/tor.real \
  && ln -s /usr/sbin/tor-shim.sh /usr/sbin/tor \
  && tor --version | head -1
+# 容器入口：把容器内所有 DNS 重定向到 Tor DNSPort（见 deploy/artex-entry.sh）
+COPY deploy/artex-entry.sh /usr/local/bin/artex-entry.sh
+RUN chmod 755 /usr/local/bin/artex-entry.sh
+ENTRYPOINT ["/usr/local/bin/artex-entry.sh"]

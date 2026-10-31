@@ -14,6 +14,9 @@ services:
       dockerfile: Dockerfile.tor
     extra_hosts:
       - "postgres:172.18.0.3"
+    # 入口脚本要在容器 netns 里装 DNS 重定向规则（见 deploy/artex-entry.sh）
+    cap_add:
+      - NET_ADMIN
     ports: !override
       - "8787:8787"
       - "127.0.0.1:8788:8788"
