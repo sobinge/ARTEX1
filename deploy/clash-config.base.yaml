@@ -1,10 +1,19 @@
 # 无订阅时的最小可用配置：本地混合入站（HTTP+SOCKS）只绑回环，全部直连。
+# DNS 用 mihomo 内置解析（DoH，走 clash uid 的直连豁免）；不能依赖系统 resolver：
+# 系统 resolver 指向 tor DNSPort，而 clash uid 已被 iptables 放行，那条路是空的。
 mixed-port: 7890
 allow-lan: false
 bind-address: 127.0.0.1
 external-controller: 127.0.0.1:9090
 mode: rule
 log-level: warning
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://dns.google/dns-query
 proxies: []
 proxy-groups: []
 rules:

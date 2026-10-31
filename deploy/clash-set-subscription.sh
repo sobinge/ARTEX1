@@ -21,15 +21,28 @@ python3 - "$tmp" > "$tmp.out" <<'PY'
 import re, sys
 src = sys.argv[1]
 out = []
+skip_block = False          # 正在丢弃订阅里的 dns: 整块
 for line in open(src, encoding="utf-8", errors="replace"):
     # 订阅里的入站/控制器配置一律丢弃，避免暴露到 0.0.0.0
     if re.match(r'^(mixed-port|port|socks-port|redir-port|tproxy-port|external-controller|bind-address|allow-lan)\s*:', line):
         continue
+    if re.match(r'^dns\s*:', line):
+        skip_block = True
+        continue
+    if skip_block:
+        # 顶层键（行首非空白）说明 dns 块结束
+        if re.match(r'^[A-Za-z0-9_-]+\s*:', line):
+            skip_block = False
+        else:
+            continue
     out.append(line)
 sys.stdout.write(
-    "# 由 clash-set-subscription.sh 生成；入站只绑回环\n"
+    "# 由 clash-set-subscription.sh 生成；入站只绑回环，DNS 用内置 DoH（clash uid 直连）\n"
     "mixed-port: 7890\nallow-lan: false\nbind-address: 127.0.0.1\n"
-    "external-controller: 127.0.0.1:9090\n" + "".join(out)
+    "external-controller: 127.0.0.1:9090\n"
+    "dns:\n  enable: true\n  listen: 127.0.0.1:1053\n  ipv6: false\n"
+    "  nameserver:\n    - https://1.1.1.1/dns-query\n    - https://dns.google/dns-query\n"
+    + "".join(out)
 )
 PY
 mv "$tmp.out" "$DIR/config.yaml"
