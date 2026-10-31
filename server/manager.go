@@ -60,6 +60,9 @@ type Task struct {
 	TimeoutSeconds       int                    `json:"timeout_seconds"`
 	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	// 任务级出口覆盖：""/"inherit"=继承 Agent；tor=强制 Tor；proxy=指定代理(如 Clash)
+	EgressMode  string `json:"egress_mode,omitempty"`
+	EgressProxy string `json:"egress_proxy,omitempty"`
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
 	Store                *pgdb.ExplorationStore `json:"-"`
@@ -1046,6 +1049,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
+		EgressMode:      pt.EgressMode, EgressProxy: pt.EgressProxy,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
@@ -1104,6 +1108,26 @@ func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.Task
 	m.active = t.ID
 	m.mu.Unlock()
 	return t, nil
+}
+
+// SetTaskEgress persists the task-level egress override and refreshes the live
+// task so the API/DTO reflects it immediately (no restart needed).
+func (m *Manager) SetTaskEgress(taskID string, mode, proxy string) error {
+	id, err := strconv.ParseInt(strings.TrimSpace(taskID), 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("任务 id 无效")
+	}
+	t, ok := m.Task(taskID)
+	if !ok {
+		return fmt.Errorf("task not found")
+	}
+	if err := m.pg.SetTaskEgress(id, mode, proxy); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	t.EgressMode, t.EgressProxy = mode, proxy
+	m.mu.Unlock()
+	return nil
 }
 
 // RenameTaskCategory persists a category name and refreshes every live task DTO

@@ -442,7 +442,7 @@ func (s *Server) putTaskEgress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "数据库不可用")
 		return
 	}
-	if err := s.m.pg.SetTaskEgress(id, mode, proxy); err != nil {
+	if err := s.m.SetTaskEgress(idStr, mode, proxy); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
