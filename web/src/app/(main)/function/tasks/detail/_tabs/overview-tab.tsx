@@ -448,6 +448,18 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             <div className="text-xs font-medium text-muted-foreground">目标</div>
             <p className="text-sm whitespace-pre-wrap break-words">{task?.goal?.trim() || "—"}</p>
           </div>
+          <div className="flex flex-col gap-1.5 sm:col-span-2">
+            <div className="text-xs font-medium text-muted-foreground">出口</div>
+            <p className="text-sm">
+              {!task?.egress_mode || task.egress_mode === "inherit"
+                ? "继承 Agent 策略"
+                : task.egress_mode === "tor"
+                  ? "强制 Tor"
+                  : task.egress_mode === "proxy"
+                    ? `指定代理 ${task.egress_proxy || ""}`
+                    : task.egress_mode}
+            </p>
+          </div>
         </CardContent>
       </Card>
       {/* 目标管理：查看/新增/修改/删除本任务的探索目标。新增与修改会通知规划者并复活任务，
