@@ -59,6 +59,15 @@ apply_direct_ips() {
   return 0
 }
 
+# 供宿主机定时刷新直连白名单时复用（只重装规则，不启动应用）
+if [ "${1:-}" = "--refresh-rules" ]; then
+  if install_rules; then
+    apply_direct_ips
+    exit 0
+  fi
+  exit 1
+fi
+
 if [ "${ARTEX_TRANSPARENT_TOR:-1}" = "0" ]; then
   echo "[entry] ARTEX_TRANSPARENT_TOR=0，跳过透明代理规则" >&2
 elif install_rules; then

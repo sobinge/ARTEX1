@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh ARTEX LLM direct allowlist (hosts + iptables) inside container
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ARTEX1/deploy/refresh-llm-direct.sh artex1-artex-1 api.deepseek.com
