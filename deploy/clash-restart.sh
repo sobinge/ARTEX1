@@ -11,6 +11,10 @@ BIN=/usr/local/bin/mihomo
 [ -f "$CFG" ] || { echo "[clash] 缺少配置 $CFG" >&2; exit 1; }
 
 mkdir -p "$DIR"
+# GEO 数据库随镜像预置；数据目录里没有时补一份，避免 mihomo 启动时联网下载失败
+for f in geoip.metadb geosite.dat country.mmdb; do
+  [ -f "$DIR/$f" ] || cp "/etc/mihomo/geo/$f" "$DIR/" 2>/dev/null || true
+done
 chown -R clash:clash "$DIR" 2>/dev/null || true
 
 # 杀掉所有已有 mihomo

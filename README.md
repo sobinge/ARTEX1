@@ -354,6 +354,10 @@ Tor 出口有时会被目标或网络拦截，测试需要临时换一条出口�
   ```
   脚本会丢弃订阅自带的入站/控制器/dns 配置，强制回环绑定并注入内置 DoH，然后热重启 mihomo。
 - 无订阅时使用 `/etc/mihomo/base.yaml`（全部直连）占位，`mixed-port` 也能用来验证连通性。
+- 订阅规则常含 `GEOIP,CN,DIRECT`，mihomo 会去下载 MMDB；镜像已预置 GEO 数据库
+  （`/etc/mihomo/geo`），启动脚本在数据目录缺失时自动补齐，避免首次启动联网失败。
+- 切节点/测延迟走控制口：`GET /proxies`、`GET /proxies/<名>/delay?timeout=5000&url=http://www.gstatic.com/generate_204`、
+  `PUT /proxies/<策略组>` body `{"name":"<节点>"}`；规则引用的主策略组是订阅里的 `TapFog`。
 
 ### 「配了 Tor 却还是真实 IP」——已修的四个坑
 

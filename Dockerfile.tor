@@ -21,6 +21,14 @@ RUN apt-get update \
  && gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo \
  && chmod 755 /usr/local/bin/mihomo && rm -f /tmp/mihomo.gz \
  && /usr/local/bin/mihomo -v
+# 预置 GEO 数据库：订阅规则里常有 GEOIP,CN/DIRECT，mihomo 启动时会去 GitHub 下载
+# MMDB，而此时 DNS 还没起来（Clash 本身走 clash uid 的直连豁免）→ 解析失败导致启动失败。
+RUN mkdir -p /etc/mihomo/geo \
+ && for f in geoip.metadb geosite.dat country.mmdb; do \
+      curl -fsSL --max-time 180 -o "/etc/mihomo/geo/$f" \
+        "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/$f"; \
+    done \
+ && ls -l /etc/mihomo/geo
 COPY deploy/tor-shim.sh /usr/sbin/tor-shim.sh
 RUN chmod 755 /usr/sbin/tor-shim.sh \
  && mv /usr/sbin/tor /usr/sbin/tor.real \
