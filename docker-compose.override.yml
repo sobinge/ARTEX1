@@ -1,0 +1,16 @@
+# 本地从源码构建并叠加 tor（见 Dockerfile.tor / rebuild-local.sh）。
+# 发布端口只做端口映射，来源限制交给宿主机防火墙（Docker 发布端口会绕过 ufw）。
+services:
+  artex:
+    image: artex-tor:local
+    build:
+      context: .
+      dockerfile: Dockerfile.tor
+    ports: !override
+      - "8787:8787"
+      - "127.0.0.1:8788:8788"
+    volumes:
+      # JWT 签名密钥持久化，避免容器重建后所有人被登出。
+      # 首次使用前该文件必须存在（rebuild-local.sh 会自动 touch），
+      # 否则 Docker 会把它创建成目录。
+      - ./data/jwt.key:/app/jwt.key

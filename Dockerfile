@@ -26,6 +26,9 @@ ARG TARGETARCH
 ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
 WORKDIR /src
 COPY go.mod go.sum ./
+# go.mod 里有 replace github.com/Autumn-27/norma => ./norma，
+# 必须在 go mod download 之前就位，否则构建直接失败。
+COPY norma ./norma
 RUN go mod download
 COPY . .
 # 前端静态产物从 web 阶段拷入（.dockerignore 已排除宿主 dist，不会冲突）

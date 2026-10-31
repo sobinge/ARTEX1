@@ -1,0 +1,13 @@
+# 运行镜像叠加 tor 可执行文件：ARTEX 的目标流量默认经 Tor 出口
+# （tools.egress_class=target-probe 时 fail-closed），而 runtime 阶段未预装 tor。
+#
+# 先构建源码镜像，再构建本文件：
+#   docker build -t artex-src:local -f Dockerfile .
+#   docker build -t artex-tor:local -f Dockerfile.tor .
+# 或直接执行 ./rebuild-local.sh。
+ARG BASE=artex-src:local
+FROM ${BASE}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tor \
+ && rm -rf /var/lib/apt/lists/* \
+ && tor --version | head -1
