@@ -14,8 +14,11 @@ for a in "$@"; do
 done
 if [ -n "$torrc" ]; then
   d=$(dirname "$torrc")
-  chown -R artestor:artestor "$d" 2>/dev/null || true
-  chmod 700 "$d" 2>/dev/null || true
+  pool=$(dirname "$d")
+  # 必须连 pool 根目录一起 chown：pool 由应用以 root 创建且是 0700，
+  # 只改 slot 目录的话 artestor 连穿越都做不到（连 data/ 都会 Permission denied）。
+  chown -R artestor:artestor "$pool" 2>/dev/null || true
+  chmod 700 "$pool" "$d" 2>/dev/null || true
 fi
 
 case "$*" in
