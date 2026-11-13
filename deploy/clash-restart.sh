@@ -1,49 +1,67 @@
 #!/bin/sh
-# 容器内：以 clash 用户重启 mihomo（单实例）。
-# 注意：镜像里没有 procps（无 pgrep/pkill），只能扫描 /proc 取 PID。
-# clash uid 在 iptables 中有出站豁免，因此 Clash 的上游连接不会被容器的 Tor 代理劫持。
-set -u
-CFG=/app/data/clash/config.yaml
-DIR=/app/data/clash
+# 容器内：严格编译节点配置并以独立 UID 启动 Mihomo。
+set -eu
+umask 077
+DIR="${ARTEX_CLASH_DIR:-/var/lib/artex-clash}"
+CFG="$DIR/config.yaml"
 BIN=/usr/local/bin/mihomo
+CONFIG_TOOL=/usr/local/bin/artex-clash-config.py
 
-[ -x "$BIN" ] || { echo "[clash] 未安装 mihomo" >&2; exit 1; }
-[ -f "$CFG" ] || { echo "[clash] 缺少配置 $CFG" >&2; exit 1; }
-
+[ "${ARTEX_CLASH_ENABLED:-0}" = "1" ] || { echo '[clash] 未启用，保持拒绝' >&2; exit 2; }
+[ -x "$BIN" ] || { echo '[clash] 未安装 mihomo' >&2; exit 1; }
 mkdir -p "$DIR"
-# GEO 数据库随镜像预置；数据目录里没有时补一份，避免 mihomo 启动时联网下载失败
-for f in geoip.metadb geosite.dat country.mmdb; do
-  [ -f "$DIR/$f" ] || cp "/etc/mihomo/geo/$f" "$DIR/" 2>/dev/null || true
-done
-chown -R clash:clash "$DIR" 2>/dev/null || true
+chmod 700 "$DIR"
+exec 9>"$DIR/.restart.lock"
+flock -x 9
 
-# 杀掉所有已有 mihomo
+# 已持久化的节点优先；旧 data/clash 仅安全读取迁移，不覆盖旧文件。
+/usr/bin/python3 "$CONFIG_TOOL" prepare --directory "$DIR"
+chown -R clash:clash "$DIR"
+chmod 600 "$CFG" "$DIR/controller.secret"
+
 for p in /proc/[0-9]*; do
-  [ "$(cat "$p/comm" 2>/dev/null)" = "mihomo" ] && kill "${p#/proc/}" 2>/dev/null
+  if [ "$(cat "$p/comm" 2>/dev/null)" = 'mihomo' ]; then
+    kill "${p#/proc/}" 2>/dev/null || true
+  fi
 done
 i=0
-while [ "$i" -lt 20 ]; do
+while [ "$i" -lt 30 ]; do
   alive=0
   for p in /proc/[0-9]*; do
-    [ "$(cat "$p/comm" 2>/dev/null)" = "mihomo" ] && alive=1
+    if [ "$(cat "$p/comm" 2>/dev/null)" = 'mihomo' ]; then alive=1; fi
   done
-  [ "$alive" = "0" ] && break
-  i=$((i+1)); sleep 0.3
+  [ "$alive" = '0' ] && break
+  i=$((i+1))
+  sleep 0.2
 done
+if [ "$alive" != '0' ]; then
+  echo '[clash] 旧实例未停止，拒绝启动第二个实例' >&2
+  exit 1
+fi
 
-setpriv --reuid clash --regid clash --init-groups "$BIN" -d "$DIR" -f "$CFG" >>"$DIR/mihomo.log" 2>&1 &
-
+# 不向日志/终端输出 controller secret 或节点配置。
+setpriv --reuid clash --regid clash --init-groups "$BIN" -d "$DIR" -f "$CFG" >>"$DIR/mihomo.log" 2>&1 9>&- &
+echo "$!" >"$DIR/mihomo.pid"
 i=0
-while [ "$i" -lt 20 ]; do
-  sleep 0.5
-  if curl -s --max-time 2 http://127.0.0.1:9090/version >/dev/null 2>&1; then
-    n=0
-    for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = "mihomo" ] && n=$((n+1)); done
-    echo "[clash] 已启动（实例数=$n）: mixed-port 127.0.0.1:7890, controller 127.0.0.1:9090"
+while [ "$i" -lt 30 ]; do
+  if /usr/bin/python3 - "$DIR" <<'CLASH_CHECK'
+from pathlib import Path
+import sys, urllib.request
+try:
+    secret = (Path(sys.argv[1]) / 'controller.secret').read_text().strip()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request('http://127.0.0.1:9090/version', headers={'Authorization': 'Bearer ' + secret})
+    with opener.open(req, timeout=0.5) as response:
+        assert response.status == 200
+except Exception:
+    sys.exit(1)
+CLASH_CHECK
+  then
+    echo '[clash] 已启动严格代理入口 127.0.0.1:7890；无节点时只拒绝连接'
     exit 0
   fi
   i=$((i+1))
+  sleep 0.3
 done
-echo "[clash] 启动失败，最近日志:" >&2
-tail -5 "$DIR/mihomo.log" >&2 2>/dev/null || true
+echo '[clash] 启动失败；Clash 请求保持拒绝，详情仅保存在私密日志' >&2
 exit 1

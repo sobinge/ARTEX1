@@ -33,22 +33,10 @@ ensure_docker(){
 # ── ① 全部 Docker ───────────────────────────────
 install_docker(){
   ensure_docker
-  if [ ! -f .env ]; then
-    cp .env.example .env 2>/dev/null || true
-    local pw key
-    pw="$(ask 'Postgres 密码（回车随机生成）' "$(rand)")"
-    key="$(ask 'ANTHROPIC_API_KEY（可留空，后续在 UI 配）' '')"
-    sed -i.bak "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${pw}|" .env
-    sed -i.bak "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${key}|" .env
-    rm -f .env.bak
-    ok "已生成 .env（POSTGRES_PASSWORD 已设置）"
-  else
-    info "沿用已存在的 .env"
-  fi
-  info "拉取镜像并启动…"
-  docker compose pull || true
-  docker compose up -d
-  ok "启动完成 → http://localhost:8787"
+  info "从当前源码构建并启动（含 Tor 实例池、Clash 路由与前端）…"
+  ./rebuild-local.sh
+  ok "安装完成；默认地址 → http://localhost:8787"
+  info "首次进入页面设置管理员密码，并在 UI 配置模型"
   info "查看日志：docker compose logs -f artex"
 }
 
@@ -109,6 +97,23 @@ JSON
   info "启动…（Ctrl-C 退出）"
   ./artex
 }
+
+case "${1:-}" in
+  --docker)
+    [ "$#" -eq 1 ] || die "用法：./install.sh --docker"
+    install_docker; exit ;;
+  --local)
+    [ "$#" -eq 1 ] || die "用法：./install.sh --local"
+    install_local; exit ;;
+  -h|--help)
+    printf '%s\n' '用法：./install.sh [--docker | --local]' \
+      '  --docker  从当前源码一键构建并启动 Docker（含 Tor/Clash）' \
+      '  --local   本地编译安装' \
+      '  不带参数时显示交互菜单。'
+    exit ;;
+  '') ;;
+  *) die "未知参数：$1；使用 ./install.sh --help 查看用法" ;;
+esac
 
 echo "=============================="
 echo "  ARTEX 安装"

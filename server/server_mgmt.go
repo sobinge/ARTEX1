@@ -289,9 +289,9 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 	// 可选:创建时就带上出口策略(自定义会话 Agent 常见需求)。
 	if m := strings.TrimSpace(req.EgressMode); m != "" && m != "inherit" {
 		switch m {
-		case "direct", "proxy", "tor":
+		case "direct", "proxy", "tor", "clash":
 		default:
-			writeErr(w, 400, "egress_mode 需为 inherit/direct/proxy/tor")
+			writeErr(w, 400, "egress_mode 需为 inherit/direct/proxy/tor/clash")
 			return
 		}
 		rotate := strings.TrimSpace(req.TorRotate)
@@ -517,9 +517,9 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 			circuit = strings.TrimSpace(*req.TorCircuitKey)
 		}
 		switch mode {
-		case "inherit", "direct", "proxy", "tor":
+		case "inherit", "direct", "proxy", "tor", "clash":
 		default:
-			writeErr(w, 400, "egress_mode 需为 inherit/direct/proxy/tor")
+			writeErr(w, 400, "egress_mode 需为 inherit/direct/proxy/tor/clash")
 			return
 		}
 		if mode == "proxy" && proxy == "" {
@@ -553,6 +553,10 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		if err := pg.SetAgentEgress(a.Key, mode, proxy, country, rotate, circuit, torInst); err != nil {
 			writeErr(w, 500, err.Error())
 			return
+		}
+		if s.m.routing != nil {
+			s.m.routing.router.CloseIdleConnections()
+			s.m.routing.recordPolicyChange("manual-agent-switch", "", a.Key, mode)
 		}
 	}
 	// an agent's LLM binding change also invalidates pinned-task / per-profile caches

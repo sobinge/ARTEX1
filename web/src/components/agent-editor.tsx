@@ -69,7 +69,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const [ttTurnsDefault, setTtTurnsDefault] = React.useState(5);
   const [settings, setSettings] = React.useState<Settings | null>(null);
   // 出口策略（Tor）
-  const [egressMode, setEgressMode] = React.useState<"inherit" | "direct" | "proxy" | "tor">("inherit");
+  const [egressMode, setEgressMode] = React.useState<"inherit" | "direct" | "proxy" | "tor" | "clash">("inherit");
   const [egressProxy, setEgressProxy] = React.useState("");
   const [torCountry, setTorCountry] = React.useState("");
   const [torRotate, setTorRotate] = React.useState<"off" | "per_run" | "per_intent" | "per_task">("off");
@@ -668,10 +668,10 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
       {/* MCP 可见性 */}
       <TabsContent value="egress" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         <div className="grid gap-4 py-3">
-          {settings?.egress_strict !== false && egressMode === "inherit" && !settings?.tor_socks_addr && (
+          {settings?.egress_strict !== false && egressMode === "inherit" && !settings?.tor_socks_addr && !settings?.tor_pool_enabled && !settings?.global_proxy && (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
-              <b>严格模式已开启（fail-closed）</b>：当前没有配置匿名出口，所有触达目标的工具都会被拒绝执行，
-              不会回退直连。请在「系统配置」填写 Tor SOCKS 地址，或在此为 Agent 选择 Tor / 代理。
+              <b>严格模式已开启（fail-closed）</b>：当前没有配置可用的目标出口，触达目标的工具会被拒绝执行，
+              不会回退直连。请在「系统配置」填写 Tor SOCKS 地址，或在此为 Agent 选择 Tor / Clash / 代理。
             </div>
           )}
 
@@ -685,6 +685,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                   <SelectItem value="direct">直连（严格模式下会被拒绝）</SelectItem>
                   <SelectItem value="proxy">指定代理</SelectItem>
                   <SelectItem value="tor">Tor（远程 DNS · 电路隔离）</SelectItem>
+                  <SelectItem value="clash">Clash（仅代理节点）</SelectItem>
                 </SelectContent>
               </Select>
               <span className="text-muted-foreground text-xs">
@@ -699,6 +700,12 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                   value={egressProxy} onChange={(e) => setEgressProxy(e.target.value)} />
                 <span className="text-muted-foreground text-xs">socks5h 让代理解析域名；socks5 会本地解析（.onion 不可用且泄露 DNS）。</span>
               </div>
+            )}
+
+            {egressMode === "clash" && (
+              <p className="text-muted-foreground text-xs">
+                使用系统配置的 Clash 出口；无可用代理节点时拒绝连接。此选择不允许自动回退 Tor 或直连。
+              </p>
             )}
 
             {egressMode === "tor" && (

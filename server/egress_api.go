@@ -2,15 +2,17 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strings"
+	"os"
 	"time"
 
+	"github.com/Autumn-27/artex/egressroute"
 	"github.com/Autumn-27/artex/tor"
+	"github.com/Autumn-27/artex/traffic"
 )
 
 // egressProbe is the result of a real request through the agent's egress.
@@ -22,42 +24,35 @@ type egressProbe struct {
 	Error     string `json:"error,omitempty"`
 }
 
-// probeEgress makes two requests through plan: one for the exit IP, one to the
-// Tor project's check endpoint. Both go through the resolved proxy so the numbers
-// describe the egress the agent will actually use.
+// probeEgress obtains the exit IP and Tor status in one official check request.
 func probeEgress(ctx context.Context, plan EgressPlan) egressProbe {
-	client := &http.Client{Timeout: 25 * time.Second}
-	if plan.ProxyURL != "" {
-		u, err := url.Parse(plan.ProxyURL)
+	return probeRoutingURL(ctx, plan, "https://check.torproject.org/api/ip")
+}
+
+func egressProbeClient(plan EgressPlan) (*http.Client, error) {
+	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true}
+	u, err := traffic.ValidateProxyURL(plan.ProxyURL)
+	if err != nil || u == nil {
+		return nil, fmt.Errorf("出口检测必须使用有效代理；不会回退直连")
+	}
+	transport.Proxy = http.ProxyURL(u)
+	if plan.CACert != "" {
+		pem, err := os.ReadFile(plan.CACert)
 		if err != nil {
-			return egressProbe{Error: "代理地址无效: " + err.Error()}
+			return nil, fmt.Errorf("读取记录代理 CA 失败: %w", err)
 		}
-		client.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+		pool, _ := x509.SystemCertPool()
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("记录代理 CA 无效")
+		}
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
-	start := time.Now()
-	ip, err := getBody(ctx, client, "https://api.ipify.org")
-	if err != nil {
-		return egressProbe{Error: err.Error()}
-	}
-	out := egressProbe{IP: strings.TrimSpace(ip), LatencyMS: time.Since(start).Milliseconds()}
-	if body, err := getBody(ctx, client, "https://check.torproject.org/api/ip"); err == nil {
-		var r struct {
-			IsTor bool   `json:"IsTor"`
-			IP    string `json:"IP"`
-		}
-		if json.Unmarshal([]byte(body), &r) == nil {
-			out.IsTor = r.IsTor
-		}
-	}
-	if body, err := getBody(ctx, client, "http://ip-api.com/json/"+out.IP+"?fields=country,countryCode"); err == nil {
-		var geo struct {
-			Country string `json:"country"`
-		}
-		if json.Unmarshal([]byte(body), &geo) == nil {
-			out.Country = geo.Country
-		}
-	}
-	return out
+	return &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}, nil
 }
 
 func getBody(ctx context.Context, c *http.Client, u string) (string, error) {
@@ -92,6 +87,9 @@ func (s *Server) getAgentEgress(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = pg
 	plan, err := s.resolveEgress(a, "")
+	if s.m.routing != nil {
+		plan, err = s.routePlan(egressroute.Binding{AgentKey: a.Key}, "check.torproject.org")
+	}
 	resp := map[string]any{
 		"agent_key": a.Key,
 		"mode":      a.EgressMode,
@@ -114,6 +112,9 @@ func (s *Server) testAgentEgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	plan, err := s.resolveEgress(a, "")
+	if s.m.routing != nil {
+		plan, err = s.routePlan(egressroute.Binding{AgentKey: a.Key}, "check.torproject.org")
+	}
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return

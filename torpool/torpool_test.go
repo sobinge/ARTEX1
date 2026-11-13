@@ -6,7 +6,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -150,6 +152,70 @@ func TestStartFailsWithMissingBinary(t *testing.T) {
 	}
 	if p.Started() {
 		t.Fatal("pool marked started after failed Start")
+	}
+}
+
+func TestParallelStartFailureReapsEverySpawnedDaemon(t *testing.T) {
+	cfg := testConfig(t)
+	// Other packages run their own pool fixtures concurrently. Pick a free
+	// contiguous range rather than colliding with their fixed example ports.
+	for {
+		first, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := first.Addr().(*net.TCPAddr).Port
+		listeners := []net.Listener{first}
+		if base+2*cfg.Size-1 <= 65535 {
+			for offset := 1; offset < 2*cfg.Size; offset++ {
+				ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(base+offset))
+				if err != nil {
+					break
+				}
+				listeners = append(listeners, ln)
+			}
+		}
+		for _, ln := range listeners {
+			ln.Close()
+		}
+		if len(listeners) == 2*cfg.Size {
+			cfg.SocksBase, cfg.ControlBase = base, base+cfg.Size
+			break
+		}
+	}
+	cfg.StartupTimeout = 3 * time.Second
+	cfg.Binary = filepath.Join(t.TempDir(), "tor-stub")
+	// Each slot records its own PID. Slot 2 exits, while its peers stay alive
+	// until the failed all-or-nothing startup cancels and reaps them.
+	script := "#!/bin/sh\nprintf '%s' \"$$\" > \"$2.pid\"\ncase \"$2\" in */tor-02/torrc) exit 1;; esac\nexec sleep 60\n"
+	if err := os.WriteFile(cfg.Binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err == nil {
+		p.Stop()
+		t.Fatal("unready stub pool unexpectedly started")
+	} else {
+		t.Logf("expected startup failure: %v", err)
+	}
+	if p.Started() {
+		t.Fatal("failed pool reported started")
+	}
+	for _, inst := range p.Instances() {
+		pidText, err := os.ReadFile(inst.TorrcPath + ".pid")
+		if err != nil {
+			t.Fatalf("slot %d did not start alongside its peers: %v", inst.ID, err)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(pidText)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inst.cmd != nil || syscall.Kill(pid, syscall.Signal(0)) == nil {
+			t.Fatalf("slot %d process %d survived startup failure", inst.ID, pid)
+		}
 	}
 }
 

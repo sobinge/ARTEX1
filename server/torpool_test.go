@@ -1,8 +1,14 @@
 package server
 
 import (
+	"bufio"
+	"context"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/torpool"
@@ -19,6 +25,62 @@ func newPoolForTest(t *testing.T, size int) *torpool.Pool {
 	if err != nil {
 		t.Fatalf("torpool.New: %v", err)
 	}
+	// Adopt protocol stubs so routing tests use a genuinely started pool and
+	// still exercise the same readiness checks as a real Tor process.
+	for _, inst := range pool.Instances() {
+		if err := os.MkdirAll(filepath.Dir(inst.CookiePath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(inst.CookiePath, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		socks, err := net.Listen("tcp", inst.SocksAddr)
+		if err != nil {
+			t.Skipf("cannot bind test SOCKS: %v", err)
+		}
+		t.Cleanup(func() { socks.Close() })
+		ctrl, err := net.Listen("tcp", inst.ControlAddr)
+		if err != nil {
+			t.Skipf("cannot bind test control: %v", err)
+		}
+		t.Cleanup(func() { ctrl.Close() })
+		go func() {
+			for {
+				conn, err := ctrl.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer conn.Close()
+					br := bufio.NewReader(conn)
+					if _, err := br.ReadString('\n'); err != nil {
+						return
+					}
+					conn.Write([]byte("250 OK\r\n"))
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					switch {
+					case strings.HasPrefix(line, "GETINFO config-file"):
+						conn.Write([]byte("250-config-file=" + inst.TorrcPath + "\r\n250 OK\r\n"))
+					case strings.HasPrefix(line, "GETINFO status/bootstrap-phase"):
+						conn.Write([]byte("250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=100 TAG=done SUMMARY=\"Done\"\r\n250 OK\r\n"))
+					case strings.HasPrefix(line, "SIGNAL SHUTDOWN"):
+						conn.Write([]byte("250 OK\r\n"))
+						ctrl.Close()
+						socks.Close()
+					}
+				}()
+			}
+		}()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Stop)
 	return pool
 }
 
@@ -107,5 +169,93 @@ func TestValidateTorInstance(t *testing.T) {
 	so := &Server{m: off}
 	if _, err := so.validateTorInstance(1); err == nil {
 		t.Fatal("pin accepted while pool disabled")
+	}
+}
+
+func TestResolveEgressInheritUsesReadyTorPool(t *testing.T) {
+	pool := newPoolForTest(t, 3)
+	s := &Server{m: &Manager{egressStrict: true, torPool: pool, torPoolEnabled: true}}
+	a := &db.Agent{Key: "worker", EgressMode: "inherit", EgressTorInstance: 2, TorCircuitKey: "agent"}
+	plan, err := s.resolveEgress(a, "task-1")
+	if err != nil || plan.TorInstance != 2 || plan.ProxyURL != "socks5h://agent-worker:x@127.0.0.1:19051" || !plan.IsTor {
+		t.Fatalf("inherit failed to use isolated pooled Tor: %+v, err=%v", plan, err)
+	}
+	s.m.globalProxy = "http://explicit:8080"
+	plan, err = s.resolveEgress(a, "task-1")
+	if err != nil || plan.ProxyURL != "http://explicit:8080" {
+		t.Fatalf("explicit global proxy lost precedence: %+v, err=%v", plan, err)
+	}
+	a.EgressMode, a.EgressProxy = "proxy", "http://agent:8080"
+	plan, err = s.resolveEgress(a, "task-1")
+	if err != nil || plan.ProxyURL != a.EgressProxy {
+		t.Fatalf("explicit agent proxy lost precedence: %+v, err=%v", plan, err)
+	}
+}
+
+func TestResolveEgressUnavailablePoolFailsClosed(t *testing.T) {
+	unstarted, err := torpool.New(torpool.Config{Dir: t.TempDir(), Size: 1, SocksBase: 19050, ControlBase: 19150})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pool := range []*torpool.Pool{nil, unstarted} {
+		for _, strict := range []bool{false, true} {
+			s := &Server{m: &Manager{torPoolEnabled: true, torPool: pool, egressStrict: strict, torSocksAddr: "127.0.0.1:9050"}}
+			for _, mode := range []string{"inherit", "tor"} {
+				if _, err := s.resolveEgress(&db.Agent{Key: "worker", EgressMode: mode}, "task"); err == nil || !strings.Contains(err.Error(), "不会回退直连") {
+					t.Fatalf("unavailable pool must refuse (strict=%v mode=%s): %v", strict, mode, err)
+				}
+			}
+			if proxy, _ := s.egressProxyFor("worker", "task"); proxy != blackholeProxy {
+				t.Fatalf("unavailable pool escaped blackhole: %q", proxy)
+			}
+		}
+	}
+}
+
+func TestStartTorPoolFailureStopsOldPoolAndClearsReference(t *testing.T) {
+	old := newPoolForTest(t, 1)
+	m := &Manager{torPool: old, torPoolEnabled: true, torPoolSize: 1, torPoolSocksBase: 19050, torPoolControlBase: 19150, torPoolDir: t.TempDir(), torBinary: "/nonexistent/tor"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := m.StartTorPool(ctx); err == nil {
+		t.Fatal("missing executable unexpectedly started")
+	}
+	if old.Started() || m.TorPool() != nil {
+		t.Fatal("restart failure left an old or half-started pool published")
+	}
+}
+
+func TestStopTorPoolCancelsConcurrentBootstrap(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "tor-stub")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexec sleep 60\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{torPoolEnabled: true, torPoolSize: 1, torPoolSocksBase: 19050, torPoolControlBase: 19150, torPoolDir: t.TempDir(), torBinary: bin}
+	result := make(chan error, 1)
+	go func() { result <- m.StartTorPool(context.Background()) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		m.mu.RLock()
+		starting := m.torPoolCancel != nil
+		m.mu.RUnlock()
+		if starting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bootstrap did not begin")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.StopTorPool()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("canceled bootstrap unexpectedly succeeded")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop did not cancel bootstrap promptly")
+	}
+	if m.TorPool() != nil {
+		t.Fatal("pool was published after Stop")
 	}
 }

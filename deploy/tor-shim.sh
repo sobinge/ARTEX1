@@ -21,6 +21,13 @@ if [ -n "$torrc" ]; then
   chmod 700 "$pool" "$d" 2>/dev/null || true
 fi
 
+# 可选的网桥配置独立挂载，重建容器不丢失，也不改写池生成的 torrc。
+# 使用 defaults 文件让实例自己的数据目录/端口仍由池配置决定。
+bridge_config="${ARTEX_TOR_BRIDGES_FILE:-/etc/tor/artex-bridges.torrc}"
+if [ -s "$bridge_config" ]; then
+  set -- --defaults-torrc "$bridge_config" "$@"
+fi
+
 case "$*" in
   *"/tor-01/torrc"*)
     exec /usr/sbin/tor.real "$@" --User artestor \

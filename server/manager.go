@@ -57,19 +57,19 @@ type Task struct {
 	CompanyIDs         []int64 `json:"company_ids,omitempty"`
 	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
-	TimeoutSeconds       int                    `json:"timeout_seconds"`
-	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
-	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	TimeoutSeconds       int  `json:"timeout_seconds"`
+	PlanHeartbeatSeconds int  `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
+	CoverageEnabled      bool `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
 	// 任务级出口覆盖：""/"inherit"=继承 Agent；tor=强制 Tor；proxy=指定代理(如 Clash)
-	EgressMode  string `json:"egress_mode,omitempty"`
-	EgressProxy string `json:"egress_proxy,omitempty"`
-	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
-	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
-	Store                *pgdb.ExplorationStore `json:"-"`
-	Guard                *guard.Guard           `json:"-"`
-	notify               chan struct{}
-	lifecycleMu          sync.RWMutex
-	llmMu                sync.RWMutex
+	EgressMode  string                 `json:"egress_mode,omitempty"`
+	EgressProxy string                 `json:"egress_proxy,omitempty"`
+	FirstRunAt  int64                  `json:"first_run_at,omitempty"`
+	DeadlineAt  int64                  `json:"deadline_at,omitempty"`
+	Store       *pgdb.ExplorationStore `json:"-"`
+	Guard       *guard.Guard           `json:"-"`
+	notify      chan struct{}
+	lifecycleMu sync.RWMutex
+	llmMu       sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -250,6 +250,7 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+	routing     *egressRuntime
 	// egressStrict is fail-closed mode: target traffic must have an anonymous
 	// egress, and an unavailable one aborts the action instead of dialing direct.
 	egressStrict bool
@@ -276,6 +277,10 @@ type Manager struct {
 	// blocked; empty = direct.
 	torPoolUpstream string
 	torPool         *torpool.Pool
+	// Serialize process replacement separately from the settings/read mutex.
+	torPoolMu     sync.Mutex
+	torPoolCancel context.CancelFunc
+	torPoolClosed bool
 }
 
 // Settings keys the UI toggles at runtime.
@@ -420,6 +425,10 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := bootstrapTorPoolEnv(pg, os.Getenv); err != nil {
+		pg.Close()
+		return nil, fmt.Errorf("initialize Tor pool deployment settings: %w", err)
+	}
 	if err := pg.RecoverFindingRetests(); err != nil {
 		pg.Close()
 		return nil, fmt.Errorf("recover finding retests: %w", err)
@@ -547,6 +556,13 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
 		}
 	}
+	if err := m.startEgressRouting(); err != nil {
+		if m.traffic != nil {
+			_ = m.traffic.Close()
+		}
+		_ = pg.Close()
+		return nil, fmt.Errorf("initialize target egress routing: %w", err)
+	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
@@ -565,7 +581,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if m.torPoolEnabled {
 		torpool.SetLogger(log.Printf)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), torPoolStartupTimeout(m.TorPoolSize()))
 			defer cancel()
 			if err := m.StartTorPool(ctx); err != nil {
 				log.Printf("[torpool] 启动失败: %v", err)
@@ -881,6 +897,9 @@ func (m *Manager) ProxyAddr() string {
 	if m.traffic != nil && m.TrafficEnabled() {
 		return m.traffic.ProxyAddr()
 	}
+	if m.routing != nil {
+		return m.routing.baseURL
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.globalProxy
@@ -1005,6 +1024,13 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
+	if m.routing != nil {
+		m.routing.Close()
+	}
+	m.mu.Lock()
+	m.torPoolClosed = true
+	m.mu.Unlock()
+	m.StopTorPool()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.traffic != nil {
@@ -1050,7 +1076,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
 		EgressMode:      pt.EgressMode, EgressProxy: pt.EgressProxy,
-		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
+		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
 }

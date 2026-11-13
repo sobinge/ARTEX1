@@ -169,7 +169,12 @@ type Traffic struct {
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
-	upstream atomic.Pointer[url.URL]
+	upstream         atomic.Pointer[url.URL]
+	upstreamResolver atomic.Pointer[upstreamResolver]
+}
+
+type upstreamResolver struct {
+	resolve func(*http.Request) (*url.URL, error)
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -218,7 +223,12 @@ func Open(dir, addr string) (*Traffic, error) {
 	// a direct dial. When a global egress proxy IS configured (SetUpstreamProxy),
 	// every captured request — intercepted AND transparently tunneled — is
 	// forwarded through it instead, so no host leaks the real source IP.
-	p.SetUpstreamProxy(func(*http.Request) (*url.URL, error) { return t.upstream.Load(), nil })
+	p.SetUpstreamProxy(func(req *http.Request) (*url.URL, error) {
+		if selector := t.upstreamResolver.Load(); selector != nil {
+			return selector.resolve(req)
+		}
+		return t.upstream.Load(), nil
+	})
 	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
@@ -327,6 +337,17 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	return nil
 }
 
+// SetUpstreamResolver keeps the original proxy request (including CONNECT's
+// authentication) available when choosing an upstream for both MITM and tunnels.
+// A resolver error aborts the request; it never falls back to a direct dial.
+func (t *Traffic) SetUpstreamResolver(resolve func(*http.Request) (*url.URL, error)) {
+	if resolve == nil {
+		t.upstreamResolver.Store(nil)
+		return
+	}
+	t.upstreamResolver.Store(&upstreamResolver{resolve: resolve})
+}
+
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5/socks5h,
 // optional user:pass), returning the parsed URL. Exposed so callers can validate a global
 // proxy before persisting it even when the traffic proxy itself is disabled.
@@ -399,6 +420,41 @@ func (t *Traffic) DB() *sql.DB { return t.db }
 type sink struct {
 	mproxy.BaseAddon
 	t *Traffic
+}
+
+func (s *sink) Requestheaders(f *mproxy.Flow) {
+	if f.Request == nil {
+		return
+	}
+	// Keep the original request intact for upstream context selection, but
+	// never send hop-by-hop proxy credentials to targets or recorded flows.
+	f.Request.Header = f.Request.Header.Clone()
+	f.Request.Header.Del("Proxy-Authorization")
+	f.Request.Header.Del("Proxy-Connection")
+}
+
+// go-mitmproxy reconstructs buffered requests with bytes.Reader. net/http then
+// supplies GetBody and may replay a POST with Idempotency-Key after a lost
+// response on a pooled connection. Keep unsafe bodies opaque, including empty
+// bodies, so that the recording layer cannot silently retry target operations.
+// The original idempotency headers and payload are preserved for the target.
+func (s *sink) StreamRequestModifier(f *mproxy.Flow, body io.Reader) io.Reader {
+	if f != nil && f.Request != nil && (f.Request.Method == http.MethodGet || f.Request.Method == http.MethodHead) {
+		return body
+	}
+	if body == nil {
+		body = bytes.NewReader(nil)
+	}
+	return &singleAttemptBody{Reader: body}
+}
+
+type singleAttemptBody struct{ io.Reader }
+
+func (body *singleAttemptBody) Close() error {
+	if closer, ok := body.Reader.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 func (s *sink) Response(f *mproxy.Flow) {

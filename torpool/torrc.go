@@ -84,7 +84,7 @@ func (c *Config) validate() error {
 		c.MaxCircuitDirtiness = 600
 	}
 	if c.StartupTimeout <= 0 {
-		c.StartupTimeout = 45 * time.Second
+		c.StartupTimeout = 120 * time.Second
 	}
 	return nil
 }

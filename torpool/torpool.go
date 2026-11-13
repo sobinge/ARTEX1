@@ -171,11 +171,32 @@ func (p *Pool) Start(ctx context.Context) error {
 	copy(insts, p.insts)
 	p.mu.Unlock()
 
+	// Bootstrap slots together. Cancel peers on the first failure, then wait
+	// for all startOne calls before Stop touches their process handles.
+	startCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make(chan error, len(insts))
+	var wg sync.WaitGroup
 	for _, inst := range insts {
-		if err := p.startOne(ctx, inst); err != nil {
-			p.Stop()
-			return err
-		}
+		wg.Add(1)
+		go func(inst *Instance) {
+			defer wg.Done()
+			if err := p.startOne(startCtx, inst); err != nil {
+				errs <- err
+				cancel()
+			}
+		}(inst)
+	}
+	wg.Wait()
+	select {
+	case err := <-errs:
+		p.Stop()
+		return err
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		p.Stop()
+		return err
 	}
 
 	p.mu.Lock()
@@ -193,7 +214,9 @@ func (p *Pool) startOne(ctx context.Context, inst *Instance) error {
 		lc.Printf("[torpool] 接管已有实例 %d (%s, torrc=%s)", inst.ID, inst.ControlAddr, cfgFile)
 		inst.adopted = true
 		inst.cmd = nil
-		return nil
+		readyCtx, cancel := context.WithTimeout(ctx, p.cfg.StartupTimeout)
+		defer cancel()
+		return waitReady(readyCtx, inst)
 	}
 	if dialable(inst.SocksAddr) == nil || dialable(inst.ControlAddr) == nil {
 		return fmt.Errorf("torpool: 实例 %d 的端口已被占用（%s / %s），"+

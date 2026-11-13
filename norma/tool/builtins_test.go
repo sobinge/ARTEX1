@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -213,53 +213,33 @@ func TestWebFetchRejectsStaticAssets(t *testing.T) {
 	}
 }
 
-func TestProxyLikelyErr(t *testing.T) {
-	// Proxy/MITM-caused failures → a direct retry may help.
-	for _, s := range []string{
-		`Get "https://x/": EOF`,
-		"proxyconnect tcp: dial tcp 127.0.0.1:8788: connect: connection refused",
-		"read tcp: connection reset by peer",
-		"http2: server sent GOAWAY",
-		"remote error: tls: handshake failure",
-		"malformed HTTP response",
-	} {
-		if !proxyLikelyErr(errors.New(s)) {
-			t.Errorf("want retry (proxy-likely) for %q", s)
-		}
-	}
-	// Target/caller problems → a direct retry won't fix them.
-	for _, s := range []string{
-		"dial tcp: lookup nope.invalid: no such host",
-		"context deadline exceeded",
-		"context canceled",
-		"net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
-	} {
-		if proxyLikelyErr(errors.New(s)) {
-			t.Errorf("want NO retry for %q", s)
-		}
-	}
-	if proxyLikelyErr(nil) {
-		t.Error("nil error must be false")
-	}
-}
-
-// TestWebFetchProxyFallback proves a proxied fetch that fails for a proxy-caused
-// reason (here: the proxy port is dead → connection refused) retries once directly
-// (no proxy) and reaches the target. A successful fetch is not annotated.
-func TestWebFetchProxyFallback(t *testing.T) {
+func TestWebFetchProxyFailureNeverFallsBackDirect(t *testing.T) {
+	var targetHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHits.Add(1)
 		w.Header().Set("content-type", "text/html")
-		w.Write([]byte(`<html><body><h1>Direct OK</h1></body></html>`))
+		w.Write([]byte(`<html><body><h1>Must not be reached directly</h1></body></html>`))
 	}))
 	defer srv.Close()
+	brokenProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = connection.Close()
+		}
+	}))
+	defer brokenProxy.Close()
 	raw, _ := json.Marshal(map[string]any{"url": srv.URL})
-	res, err := NewWebFetch(WebFetchConfig{Proxy: "http://127.0.0.1:1"}).Call(context.Background(), raw, &ToolContext{})
-	if err != nil {
-		t.Fatalf("webfetch: %v", err)
+	for _, address := range []string{"http://127.0.0.1:1", brokenProxy.URL, "http://", "bad scheme://proxy", "direct://127.0.0.1:1"} {
+		res, err := NewWebFetch(WebFetchConfig{Proxy: address}).Call(context.Background(), raw, &ToolContext{})
+		if err != nil {
+			t.Fatalf("webfetch: %v", err)
+		}
+		if !res.IsError || !strings.Contains(res.Flatten(), "Error fetching URL") {
+			t.Fatalf("proxy %q should fail closed: %q", address, res.Flatten())
+		}
 	}
-	out := res.Flatten()
-	if !strings.Contains(out, "Direct OK") {
-		t.Fatalf("direct fallback should have fetched the page: %q", out)
+	if targetHits.Load() != 0 {
+		t.Fatalf("proxy failure leaked %d direct requests", targetHits.Load())
 	}
 }
 

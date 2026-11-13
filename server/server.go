@@ -224,7 +224,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
-		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
+		wireTools(m.pg, domainReg, s.guardEgressTool) // 工具出口与真实任务上下文保持一致
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		if err := s.seedFindingRetester(); err != nil {
@@ -868,6 +868,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/agents/{key}/egress/runs", s.listAgentEgressRuns)
 	// Tor 实例池：多 Daemon 编排，让换电路只影响单个 agent
 	mux.HandleFunc("GET /api/system/torpool", s.getTorPool)
+	mux.HandleFunc("GET /api/system/egress-routing", s.getEgressRouting)
+	mux.HandleFunc("PUT /api/system/egress-routing", s.putEgressRouting)
+	mux.HandleFunc("GET /api/system/egress-routing/status", s.getEgressRoutingStatus)
+	mux.HandleFunc("GET /api/system/egress-routing/audit", s.getEgressRoutingAudit)
+	mux.HandleFunc("POST /api/system/egress-routing/test", s.testEgressRouting)
 	mux.HandleFunc("POST /api/system/torpool/start", s.startTorPool)
 	mux.HandleFunc("POST /api/system/torpool/stop", s.stopTorPool)
 	mux.HandleFunc("PUT /api/system/torpool", s.updateTorPool)

@@ -32,17 +32,17 @@ func TestResolveEgressNonStrictIsDirect(t *testing.T) {
 	}
 }
 
-func TestResolveEgressInheritsSocksGlobalAsTor(t *testing.T) {
+func TestResolveEgressSocksProtocolDoesNotImplyTor(t *testing.T) {
 	s := newEgressTestServer("socks5h://172.18.0.1:9050", "", true)
 	plan, err := s.resolveEgress(nil, "7")
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if !plan.IsTor || plan.Mode != "tor" {
-		t.Errorf("socks5 global must resolve to tor, got %+v", plan)
+	if plan.IsTor || plan.Mode != "proxy" || plan.Provider != "proxy" {
+		t.Errorf("SOCKS protocol must not imply a Tor provider, got %+v", plan)
 	}
 	if !strings.HasPrefix(plan.ProxyURL, "socks5h://") {
-		t.Errorf("tor egress must use socks5h, got %q", plan.ProxyURL)
+		t.Errorf("explicit proxy URL must be retained, got %q", plan.ProxyURL)
 	}
 }
 
@@ -80,6 +80,13 @@ func TestResolveEgressTorWithoutAddressFails(t *testing.T) {
 	a := &db.Agent{Key: "worker", EgressMode: "tor"}
 	if _, err := s.resolveEgress(a, "1"); err == nil {
 		t.Fatal("tor mode without address must fail")
+	}
+}
+
+func TestResolveEgressTorDoesNotBorrowGenericProxy(t *testing.T) {
+	s := newEgressTestServer("socks5h://127.0.0.1:7890", "", true)
+	if _, err := s.resolveEgress(&db.Agent{Key: "worker", EgressMode: "tor"}, "1"); err == nil {
+		t.Fatal("explicit Tor without a configured Tor instance must refuse a generic SOCKS proxy")
 	}
 }
 

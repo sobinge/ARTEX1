@@ -1,102 +1,124 @@
 #!/bin/sh
-# 容器入口：把容器内**全部**出站流量强制进 Tor（透明代理），并保留两条例外：
-#   1) tor 自身（uid artestor）
-#   2) Clash（uid clash）—— Tor 出口被目标/网络拦截时，测试需要临时用 Clash 走别的出口；
-#      Clash 的上游连接若被 Tor 劫持就失去意义，因此按 uid 放行。
-# 规则：
-#   - TCP  : nat OUTPUT REDIRECT -> 127.0.0.1:9040  (tor TransPort)
-#   - DNS  : udp/tcp 53            -> 127.0.0.1:19053 (tor DNSPort)
-#   - 其它 : UDP/ICMP 直接丢弃（Tor 不承载 UDP，宁可失败也不真实出网）
-# 放行：上两条 uid、直连白名单(ARTEX_DIRECT_IPS)、loopback、容器内网、已建立连接。
-# 需要 NET_ADMIN。排障可用 ARTEX_TRANSPARENT_TOR=0 关闭。
-set -u
+# 容器出口：目标 TCP/DNS 强制经 Tor；显式平台 IP 和 Tor 自身可直连。
+# 防火墙先安装拒绝规则，再安装透明重定向。任何失败都不启动应用。
+set -eu
 
-TOR_UID="$(id -u artestor 2>/dev/null || echo '')"
-CLASH_UID="$(id -u clash 2>/dev/null || echo '')"
+TOR_UID="$(id -u artestor)"
+CLASH_UID=""
+if [ "${ARTEX_CLASH_ENABLED:-0}" = "1" ]; then
+  CLASH_UID="$(id -u clash)"
+fi
 
 install_rules() {
-  command -v iptables >/dev/null 2>&1 || return 1
+  command -v iptables-restore >/dev/null 2>&1 || return 1
+  command -v ip6tables-restore >/dev/null 2>&1 || return 1
+  # 只接受 IPv4 地址，避免错误白名单或换行被当作防火墙指令。
+  direct_ips=$(python3 - <<'PY'
+import ipaddress, os, re
+for value in re.split(r"[\s,]+", os.environ.get("ARTEX_DIRECT_IPS", "").strip()):
+    if value:
+        address = ipaddress.IPv4Address(value)
+        print(address)
+PY
+  ) || return 1
 
-  iptables -t nat -N ARTEX_TP 2>/dev/null || true
-  iptables -t nat -F ARTEX_TP || return 1
-  # uid 例外必须在 DNS/端口重定向前，否则它们自己的 DNS 也会被劫持
-  if [ -n "$CLASH_UID" ]; then
-    iptables -t nat -A ARTEX_TP -m owner --uid-owner "$CLASH_UID" -j RETURN || return 1
-  fi
-  if [ -n "$TOR_UID" ]; then
-    iptables -t nat -A ARTEX_TP -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
-  fi
-  iptables -t nat -A ARTEX_TP -p udp --dport 53 -j REDIRECT --to-ports 19053 || return 1
-  iptables -t nat -A ARTEX_TP -p tcp --dport 53 -j REDIRECT --to-ports 19053 || return 1
-  iptables -t nat -A ARTEX_TP -o lo -j RETURN || return 1
-  iptables -t nat -A ARTEX_TP -d 127.0.0.0/8 -j RETURN || return 1
-  iptables -t nat -A ARTEX_TP -d 172.16.0.0/12 -j RETURN || return 1
-  iptables -t nat -A ARTEX_TP -d 10.0.0.0/8 -j RETURN || return 1
-  iptables -t nat -A ARTEX_TP -d 192.168.0.0/16 -j RETURN || return 1
-  iptables -t nat -A ARTEX_TP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
-  iptables -t nat -A ARTEX_TP -p tcp -j REDIRECT --to-ports 9040 || return 1
-  iptables -t nat -C OUTPUT -j ARTEX_TP 2>/dev/null || iptables -t nat -A OUTPUT -j ARTEX_TP || return 1
+  # 透明代理后的包目的地为回环地址，才被允许。NAT 丢失时也不能直接出网。
+  {
+    echo '*filter'
+    echo ':ARTEX_DROP - [0:0]'
+    echo '-F ARTEX_DROP'
+    if iptables -C OUTPUT -j ARTEX_DROP 2>/dev/null; then
+      echo '-D OUTPUT -j ARTEX_DROP'
+    fi
+    echo '-I OUTPUT 1 -j ARTEX_DROP'
+    echo "-A ARTEX_DROP -m owner --uid-owner $TOR_UID -j RETURN"
+    if [ -n "$CLASH_UID" ]; then
+      echo "-A ARTEX_DROP -m owner --uid-owner $CLASH_UID -j RETURN"
+    fi
+    for ip in $direct_ips; do
+      echo "-A ARTEX_DROP -d $ip -m comment --comment artex-direct -j RETURN"
+    done
+    # Tor DNSPort 只支持 UDP，TCP DNS 必须拒绝，不能落到同号 SOCKS 端口。
+    echo '-A ARTEX_DROP -p tcp --dport 53 -j REJECT'
+    echo '-A ARTEX_DROP -o lo -j RETURN'
+    echo '-A ARTEX_DROP -d 127.0.0.0/8 -j RETURN'
+    echo '-A ARTEX_DROP -d 172.16.0.0/12 -j RETURN'
+    echo '-A ARTEX_DROP -d 10.0.0.0/8 -j RETURN'
+    echo '-A ARTEX_DROP -d 192.168.0.0/16 -j RETURN'
+    echo '-A ARTEX_DROP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN'
+    echo '-A ARTEX_DROP -j REJECT'
+    echo 'COMMIT'
+  } | iptables-restore --noflush || return 1
 
-  iptables -N ARTEX_DROP 2>/dev/null || true
-  iptables -F ARTEX_DROP || return 1
-  if [ -n "$CLASH_UID" ]; then
-    iptables -A ARTEX_DROP -m owner --uid-owner "$CLASH_UID" -j RETURN || return 1
-  fi
-  if [ -n "$TOR_UID" ]; then
-    iptables -A ARTEX_DROP -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
-  fi
-  iptables -A ARTEX_DROP -o lo -j RETURN || return 1
-  iptables -A ARTEX_DROP -d 127.0.0.0/8 -j RETURN || return 1
-  iptables -A ARTEX_DROP -d 172.16.0.0/12 -j RETURN || return 1
-  iptables -A ARTEX_DROP -d 10.0.0.0/8 -j RETURN || return 1
-  iptables -A ARTEX_DROP -d 192.168.0.0/16 -j RETURN || return 1
-  iptables -A ARTEX_DROP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
-  iptables -A ARTEX_DROP -p tcp -j RETURN || return 1
-  iptables -A ARTEX_DROP -p udp -j DROP || return 1
-  iptables -A ARTEX_DROP -p icmp -j DROP || return 1
-  iptables -C OUTPUT -j ARTEX_DROP 2>/dev/null || iptables -A OUTPUT -j ARTEX_DROP || return 1
-  return 0
+  # IPv6 没有透明转发通道，应用只允许回环和已建立的入站连接。
+  {
+    echo '*filter'
+    echo ':ARTEX6_DROP - [0:0]'
+    echo '-F ARTEX6_DROP'
+    if ip6tables -C OUTPUT -j ARTEX6_DROP 2>/dev/null; then
+      echo '-D OUTPUT -j ARTEX6_DROP'
+    fi
+    echo '-I OUTPUT 1 -j ARTEX6_DROP'
+    echo "-A ARTEX6_DROP -m owner --uid-owner $TOR_UID -j RETURN"
+    if [ -n "$CLASH_UID" ]; then
+      echo "-A ARTEX6_DROP -m owner --uid-owner $CLASH_UID -j RETURN"
+    fi
+    echo '-A ARTEX6_DROP -o lo -j RETURN'
+    echo '-A ARTEX6_DROP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN'
+    echo '-A ARTEX6_DROP -j REJECT'
+    echo 'COMMIT'
+  } | ip6tables-restore --noflush || return 1
+
+  {
+    echo '*nat'
+    echo ':ARTEX_TP - [0:0]'
+    echo '-F ARTEX_TP'
+    if iptables -t nat -C OUTPUT -j ARTEX_TP 2>/dev/null; then
+      echo '-D OUTPUT -j ARTEX_TP'
+    fi
+    # 先于 Docker 的 127.0.0.11 DNS DNAT，防止工具自选解析器绕过 Tor。
+    echo '-I OUTPUT 1 -j ARTEX_TP'
+    echo "-A ARTEX_TP -m owner --uid-owner $TOR_UID -j RETURN"
+    if [ -n "$CLASH_UID" ]; then
+      echo "-A ARTEX_TP -m owner --uid-owner $CLASH_UID -j RETURN"
+    fi
+    for ip in $direct_ips; do
+      echo "-A ARTEX_TP -d $ip -m comment --comment artex-direct -j RETURN"
+    done
+    echo '-A ARTEX_TP -p udp --dport 53 -j REDIRECT --to-ports 19053'
+    echo '-A ARTEX_TP -p tcp --dport 53 -j RETURN'
+    echo '-A ARTEX_TP -o lo -j RETURN'
+    echo '-A ARTEX_TP -d 127.0.0.0/8 -j RETURN'
+    echo '-A ARTEX_TP -d 172.16.0.0/12 -j RETURN'
+    echo '-A ARTEX_TP -d 10.0.0.0/8 -j RETURN'
+    echo '-A ARTEX_TP -d 192.168.0.0/16 -j RETURN'
+    echo '-A ARTEX_TP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN'
+    echo '-A ARTEX_TP -p tcp -j REDIRECT --to-ports 9040'
+    echo 'COMMIT'
+  } | iptables-restore --noflush || return 1
 }
 
-# 直连白名单：大模型/平台自身走真实出口（Tor 出口常被厂商封，且 Tor DNS 对部分域名
-# 会 SERVFAIL）。域名由 compose 的 extra_hosts 固定，这里只放行目标 IP。
-apply_direct_ips() {
-  for ip in ${ARTEX_DIRECT_IPS:-}; do
-    iptables -t nat -I ARTEX_TP 1 -d "$ip" -m comment --comment artex-direct -j RETURN 2>/dev/null || return 1
-    iptables -I ARTEX_DROP 1 -d "$ip" -m comment --comment artex-direct -j RETURN 2>/dev/null || return 1
-    echo "[entry] 直连白名单: $ip"
-  done
-  return 0
-}
-
-# Clash 常驻（有配置才启动；无订阅时用 /etc/mihomo/base.yaml 的直连配置占位）
 start_clash() {
-  [ -x /usr/local/bin/mihomo ] || return 0
-  [ -n "$CLASH_UID" ] || return 0
-  mkdir -p /app/data/clash
-  if [ ! -f /app/data/clash/config.yaml ]; then
-    cp /etc/mihomo/base.yaml /app/data/clash/config.yaml 2>/dev/null || return 0
+  # DIRECT 占位配置不再默认开放备用出口；显式启用时保留人工切换能力。
+  [ "${ARTEX_CLASH_ENABLED:-0}" = "1" ] || return 0
+  if ! /usr/local/bin/artex-clash-restart.sh; then
+    echo '[entry] Clash 不可用；Tor 主服务继续启动，指定 Clash 的请求将被拒绝' >&2
   fi
-  /usr/local/bin/artex-clash-restart.sh || true
 }
 
-# 供宿主机定时刷新/重装规则时复用（只重装规则，不启动应用）
 if [ "${1:-}" = "--refresh-rules" ]; then
-  if install_rules; then
-    apply_direct_ips
-    exit 0
-  fi
-  exit 1
+  install_rules
+  exit $?
 fi
 
 if [ "${ARTEX_TRANSPARENT_TOR:-1}" = "0" ]; then
-  echo "[entry] ARTEX_TRANSPARENT_TOR=0，跳过透明代理规则" >&2
+  echo '[entry] 显式关闭透明代理；仅用于排障' >&2
 elif install_rules; then
-  echo "[entry] 全流量透明代理已启用: TCP->TransPort 9040, DNS->DNSPort 19053, UDP/ICMP 丢弃"
-  apply_direct_ips || echo "[entry] 警告: 直连白名单规则安装失败" >&2
-  start_clash
+  echo '[entry] Tor 防护已启用：TCP->9040，DNS->19053，其余公网流量拒绝'
 else
-  echo "[entry] 警告: 透明代理规则安装失败（缺 NET_ADMIN/iptables）" >&2
+  echo '[entry] Tor 防火墙安装失败，拒绝启动应用（需要 NET_ADMIN 和 IPv4/IPv6 iptables）' >&2
+  exit 78
 fi
 
+start_clash
 exec /app/start.sh "$@"

@@ -14,6 +14,10 @@ import type {
   AgentTrigger,
   ArchiveBatchItem,
   EgressProbe,
+  EgressRoutingConfig,
+  EgressRoutingStatus,
+  EgressRoutingAudit,
+  EgressRoutingTestResult,
   ModelEntry,
   TorPoolInstance,
   TorPoolStatus,
@@ -266,7 +270,7 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
-    egressMode?: "inherit" | "tor" | "proxy" | "direct";
+    egressMode?: "inherit" | "tor" | "clash" | "proxy" | "direct";
     egressProxy?: string;
   }) =>
     post<Task>("/tasks", {
@@ -287,7 +291,7 @@ export const api = {
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
-  // 设置任务级出口覆盖（mode: inherit/tor/proxy/direct；proxy 时填 proxy）
+  // 设置任务级出口覆盖（mode: inherit/tor/clash/proxy/direct；proxy 时填 proxy）
   setTaskEgress: (id: string, mode: string, proxy = "") =>
     put<{ ok: boolean; egress_mode: string; egress_proxy: string }>(`/tasks/${id}/egress`, { mode, proxy }),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
@@ -1018,6 +1022,14 @@ export const api = {
     post<{ ok: boolean; probe?: EgressProbe; resolved?: ResolvedEgress; error?: string }>(`/agents/${key}/egress/test`, {}),
   agentEgressNewNym: (key: string) => post<{ ok: boolean }>(`/agents/${key}/egress/newnym`, {}),
   agentEgressRuns: (key: string) => get<{ runs: EgressRun[] }>(`/agents/${key}/egress/runs`),
+  // Tor 主出口与 Clash 指定出口：规则、受控备用和审计。
+  egressRouting: () => get<{ config: EgressRoutingConfig }>("/system/egress-routing"),
+  saveEgressRouting: (config: EgressRoutingConfig) =>
+    put<{ config: EgressRoutingConfig }>("/system/egress-routing", { config }),
+  egressRoutingStatus: () => get<{ status: EgressRoutingStatus }>("/system/egress-routing/status"),
+  egressRoutingAudit: () => get<{ events: EgressRoutingAudit[] }>("/system/egress-routing/audit"),
+  testEgressRouting: (input: { url: string; task_id?: string; agent_key?: string; mode?: "inherit" | "tor" | "clash" }) =>
+    post<EgressRoutingTestResult>("/system/egress-routing/test", input),
   // Tor 实例池
   torPool: () => get<{ ok: boolean; enabled: boolean; status: TorPoolStatus; instances?: TorPoolInstance[] }>(`/system/torpool`),
   torPoolStart: () => post<{ ok: boolean; status: TorPoolStatus }>(`/system/torpool/start`, {}),
@@ -1125,7 +1137,7 @@ export const api = {
       trigger_run_mode?: "serial" | "parallel";
       trigger_merge_mode?: "by_task" | "all" | "none";
       trigger_max_parallel?: number;
-      egress_mode?: "inherit" | "direct" | "proxy" | "tor";
+      egress_mode?: "inherit" | "direct" | "proxy" | "tor" | "clash";
       egress_proxy?: string;
       tor_exit_country?: string;
       tor_rotate?: "off" | "per_run" | "per_intent" | "per_task";

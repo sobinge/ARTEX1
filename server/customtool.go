@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,10 +15,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egressroute"
+	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -160,6 +165,14 @@ func (s *Server) pgTestCustomTool(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 	tc := &actool.ToolContext{WorkingDir: s.m.dir} // run in the project dir, like a real call
+	// Editor previews execute the same arbitrary command/script specs as saved
+	// tools, so they must pass the same routing guard before starting a process.
+	if req.Kind == "command" || req.Kind == "script" || req.Kind == "http" {
+		if err := s.checkToolEgressContext(ctx, &db.Tool{Key: "test", Kind: req.Kind}, tc); err != nil {
+			writeJSON(w, 200, map[string]any{"output": err.Error(), "is_error": true})
+			return
+		}
+	}
 	var res actool.Result
 	switch req.Kind {
 	case "command":
@@ -273,7 +286,7 @@ func (s *Server) buildCustomTool(t *db.Tool) actool.CoreTool {
 		if params == nil {
 			params = map[string]any{}
 		}
-		if err := s.checkToolEgress(t); err != nil {
+		if err := s.checkToolEgressContext(ctx, t, tc); err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
 		switch kind {
@@ -445,7 +458,49 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
 	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
-	if tr := s.httpProxyTransport(spec); tr != nil {
+	if s.m != nil && s.m.routing != nil {
+		seed := egressroute.Binding{}
+		if tc != nil {
+			seed.AgentKey = canonicalEgressAgent(tc.AgentID)
+		}
+		if ri := agent.RunInfoFrom(ctx); ri.TaskID > 0 {
+			seed.TaskID = strconv.FormatInt(ri.TaskID, 10)
+		}
+		proxyURL := s.m.routing.proxyURL(seed, true)
+		if spec.Proxy != "" {
+			parsed, parseErr := url.Parse(spec.Proxy)
+			base, _ := url.Parse(s.m.routing.baseURL)
+			validHost := parseErr == nil && parsed.Host == base.Host
+			if s.m.traffic != nil {
+				captureBase, _ := url.Parse(s.m.traffic.ProxyAddr())
+				validHost = validHost || (parseErr == nil && parsed.Host == captureBase.Host)
+			}
+			if !validHost || parsed.User == nil {
+				return actool.Errorf("HTTP 工具不能覆盖统一出口；请在任务、Agent 或目标规则中指定代理"), nil
+			}
+			password, _ := parsed.User.Password()
+			request := &http.Request{Header: http.Header{}}
+			request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(parsed.User.Username()+":"+password)))
+			registeredSeed, authErr := s.m.routing.requestSeed(request)
+			if authErr != nil {
+				return actool.Errorf("HTTP 工具出口上下文已失效"), nil
+			}
+			if registeredSeed != seed {
+				return actool.Errorf("HTTP 工具不能借用其他任务或 Agent 的出口上下文"), nil
+			}
+			proxyURL = spec.Proxy
+		}
+		configured, configErr := egressProbeClient(EgressPlan{ProxyURL: proxyURL, CACert: s.m.ProxyCACert()})
+		if configErr != nil {
+			return actool.Errorf(configErr.Error()), nil
+		}
+		configured.Timeout = timeoutOr(spec.TimeoutMs, 30000)
+		// The probe client refuses redirects to keep IP verification precise.
+		// Normal HTTP tools retain their existing redirect behavior; each new
+		// destination still passes through the context-bound routing gateway.
+		configured.CheckRedirect = nil
+		client = configured
+	} else if tr := s.httpProxyTransport(spec); tr != nil {
 		client.Transport = tr
 	}
 	resp, err := client.Do(req)
@@ -465,17 +520,24 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	proxyStr := strings.TrimSpace(spec.Proxy)
 	var caFile string
 	if spec.UseRecordingProxy {
+		if s.m == nil || s.m.ProxyAddr() == "" {
+			return &http.Transport{Proxy: func(*http.Request) (*url.URL, error) {
+				return nil, fmt.Errorf("记录代理不可用；不会回退直连")
+			}}
+		}
 		if addr := s.m.ProxyAddr(); addr != "" {
-			proxyStr = "http://" + addr
+			proxyStr = addr
 			caFile = s.m.ProxyCACert()
 		}
 	}
 	if proxyStr == "" {
 		return nil
 	}
-	pu, err := url.Parse(proxyStr)
+	pu, err := traffic.ValidateProxyURL(proxyStr)
 	if err != nil {
-		return nil
+		return &http.Transport{Proxy: func(*http.Request) (*url.URL, error) {
+			return nil, fmt.Errorf("HTTP 工具代理配置无效；不会回退直连")
+		}}
 	}
 	tr := &http.Transport{Proxy: http.ProxyURL(pu)}
 	if caFile != "" {

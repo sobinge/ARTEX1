@@ -7,7 +7,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 🌐 **在线 Demo（模拟数据）**： [https://artex-demo.mhtsec.com](https://artex-demo.mhtsec.com)
 
-📦 **该仓库为ARTEX最后一个版本纯源码备份。原 Docker 镜像源 `autumn27/artex` 已失效，现由本仓库自维护镜像 `mianhuatang11/artex`（Docker Hub）；拉取失败时可 `docker compose build` 从纯源码本地构建，无任何外部预编译依赖。**
+📦 **当前源码包含 Tor 实例池、Clash 指定出口、受控备用和出口审计。Docker 首装使用 `./install.sh --docker`，更新使用 `./rebuild-local.sh`，统一从当前目录构建前端、后端和代理运行镜像。旧版预构建镜像不保证包含这些功能。**
 
 🕵️ **目标流量默认经 Tor 出行**：per-Agent 独立 Tor 实例池 + 出口审计 + Onion 入站，策略按「流量类别」在工具执行层强制（详见 [网络出口与隐蔽通道（Tor）](#网络出口与隐蔽通道tor)）。
 
@@ -70,36 +70,65 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 > 依赖数据库 **PostgreSQL**；探索需配置 **LLM**（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可在 UI 里配）。
 
-### 方式一：一键安装脚本（推荐）
+### 方式一：交互式本地安装
 
 ```bash
-git clone https://github.com/mhtsec/ARTEX.git
-cd ARTEX
+git clone https://github.com/sobinge/ARTEX1.git
+cd ARTEX1
 ./install.sh
 ```
 
-脚本会：检测 / 自动安装 Docker → 让你选 **① 全部 Docker** 或 **② 本地编译运行**：
-
-- **① 全部 Docker**：填一个 Postgres 密码（可回车随机）→ 自动写 `.env` → `docker compose up -d`。
-- **② 本地运行**：选数据库（连已有 / 用 Docker 起一个）→ 生成 `config.json` → `go` 编译内嵌单二进制 → 启动。
+运行后选择 **② 本地编译运行**：选数据库（连接已有数据库或用 Docker 启动）→ 生成 `config.json` → 编译内嵌单二进制 → 启动。Docker 源码部署使用下一节的 `./install.sh --docker`，由它统一初始化配置并构建基础镜像、Tor/Clash 镜像。
 
 装好后打开 **http://localhost:8787**（首次进入 `/setup` 设置管理员密码）。
 
-### 方式二：Docker Compose（手动）
+### 方式二：Docker Compose（源码构建，推荐）
 
 ```bash
-git clone https://github.com/mhtsec/ARTEX.git
-cd ARTEX
-cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 mianhuatang11/artex 镜像 + postgres
+git clone https://github.com/sobinge/ARTEX1.git
+cd ARTEX1
+./install.sh --docker         # 从当前源码构建并启动 ARTEX（含 Tor / Clash）+ Postgres
 # → http://localhost:8787
 ```
 
-> 原镜像源 `autumn27/artex` 已从 Docker Hub 删除，镜像现由本仓库自维护为 **`mianhuatang11/artex`**。
-> 镜像源不可用（或想自行改代码）时，本地从纯源码构建即可：`docker compose build && docker compose up -d`。
+需要已启动的 Docker Engine/Desktop 和 [Docker Compose ≥2.24.4](https://docs.docker.com/reference/compose-file/merge/#replace-value)。脚本首次运行会生成 `.env`（随机数据库密码），保留已有 `jwt.key`，依次构建 `artex-src:local` 和 `artex-tor:local`，等待两个服务健康后退出。以后运行 `./rebuild-local.sh` 按当前源码更新；不会删除数据库卷或 `data/`。首次打开页面时设置管理员密码，再到 UI 配置模型。
+
+一键构建会带上完整功能代码；新机器的真实代理节点/订阅、所需 Tor 上游与网桥仍需按网络环境配置。Clash 默认关闭，无有效节点时拒绝连接。私有 `.env`、节点凭据和网桥参数不随源码或公共镜像分发。
+
+默认只监听本机 `127.0.0.1:8787`；需要局域网访问时，在 `.env` 设置 `ARTEX_BIND_ADDR=0.0.0.0`。端口可用 `ARTEX_PORT` / `ARTEX_PROXY_PORT` 修改，修改后执行 `docker compose up -d`。
+
+```bash
+docker compose ps                  # 查看健康状态
+docker compose logs -f artex        # 查看应用日志
+docker compose stop                # 停止服务，保留数据
+docker compose up -d                # 启动已构建的服务
+```
+
+> 默认合并 `docker-compose.override.yml`，首次部署自动启用 5 个 Tor 实例。安装与重建共用同一源码构建链；全部实例完成 bootstrap 后 Docker 才报告 healthy。实例池尚未就绪或停止时，目标请求被拒绝，不会回退直连。已有数据库中的 Tor/Agent 配置仍优先于首次部署环境默认值。
+>
+> 网络无法直接连接 Tor 时，在 `.env` 设置 `ARTEX_TOR_POOL_UPSTREAM=host.docker.internal:7897`（改为实际 HTTP CONNECT 端口，并允许容器连接）。这只是 Tor 连接中继的上游，目标仍经 Tor 出口；已有部署请通过「系统设置 → Tor 实例池」修改保存的上游配置。`ARTEX_PROXY_HOST` 是应用的显式全局代理，两个设置用途不同。
+>
+> Tor 状态和控制口 cookie 位于独立命名卷 `torstate:/var/lib/artex-tor`；PostgreSQL 保存池配置，容器重建后自动恢复。实例 SOCKS 为 `127.0.0.1:19050..19054`，控制口为 `19150..19154`，不发布到宿主机。透明 TCP/DNS 经第一个实例的 `9040/19053`，应用公网 IPv6/其余 UDP 被阻止，内网和显式平台 IP 例外保持原策略。防火墙安装失败直接退出；Clash 备用出口需显式设置 `ARTEX_CLASH_ENABLED=1`，不会自动回退。
+>
+> 镜像预装 `obfs4proxy`。普通 Tor 中继握手被阻断时，复制 `deploy/tor-bridges.conf` 为 `deploy/tor-bridges.local.conf`，取消模板最后三行的注释，将 `Bridge` 占位符替换为 [Tor 官方渠道](https://bridges.torproject.org/) 提供的完整网桥参数。在 `.env` 设置 `ARTEX_TOR_BRIDGES_CONFIG=./deploy/tor-bridges.local.conf` 后执行 `docker compose up -d --force-recreate artex`；以后修改桥文件也重复此命令加载新配置。该私有文件通过只读挂载加载，已排除出镜像构建和 Git。DNSPort 仅支持 UDP DNS；TCP DNS 会明确拒绝。
+>
 > Dockerfile 为多阶段构建（前端静态导出 → Go 静态编译 → 运行镜像），默认走国内友好依赖源，可加 `--build-arg GOPROXY=... / --build-arg NPM_REGISTRY=...` 覆盖。
 
 镜像已含常用工具（ripgrep/curl/vim/npm/nmap…）；`./skills` 与 `./data` 以绑定挂载持久化。
+
+部署后可运行 Docker 出口验证（会短暂停止 Tor 池并在 `finally` 中尝试恢复，避开正在执行的任务）：
+
+```bash
+# 核心检查：Tor 官方出口、应用连接、停池阻断与恢复；不访问回调服务
+python3 test/regression/docker_tor_check.py --core-only --output /tmp/artex-docker-tor-core-check.json
+
+# 完整检查：先按「验证方法」创建 Webhook.site token，再核对回调来源
+python3 test/regression/docker_tor_check.py \
+  --callback-provider webhook-site --callback-token "$TOR_WEBHOOK_TOKEN" \
+  --output /tmp/artex-docker-tor-webhook-check.json
+```
+
+核心检查通过时报告为 `core_ok=true`，`ok` 仍为 `false`，表示尚未完成外部回调验证。完整检查按唯一运行标识核对每个实例、透明 curl/Python/Node 和应用 HTTP 请求的回连来源，再与 Tor 官方出口列表比较；停池时同时检查 SOCKS、预解析目标 TCP 和应用拒绝结果。推荐使用新建的 Webhook.site token，详见[验证方法](#验证方法怎么证明真的在走-tor)。DNS 日志里的递归解析器 IP 不作为 HTTP 出口判断依据。
 
 远程 MCP 可在系统设置中选择 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。
 旧版 SSE 服务通常使用 `GET /sse` 建立事件流，再通过服务返回的
@@ -152,7 +181,7 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 > 升级只换程序、不动数据：Postgres 数据卷 `pgdata`、`./data`（jwt.key / SQLite 等）、`./skills` 都会保留。**数据库迁移无需手动执行**——`artex` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
 
-### 方式一：页面一键更新（推荐）
+### 方式一：页面一键更新（预编译二进制部署）
 
 在 **系统配置** 页（侧边栏「系统配置」→ `/system/settings`）的**版本与更新**卡片里，可以直接检查并安装新版本，无需登录服务器。
 
@@ -162,30 +191,27 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 - **随时可回退**：上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
 - **更新会中断正在运行的任务**——更新即重启，请在空闲时进行。
 - **开发构建不给更新**：版本号是 `dev` 或 `git describe` 带后缀时禁用，避免正式版覆盖掉本地调试的二进制。
-- **Docker 下只换程序、不换镜像**：镜像里的 playwright / nmap 等工具链不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级仍请用 `docker compose pull artex && docker compose up -d artex`。
+- **Docker 源码部署使用 `./rebuild-local.sh` 更新**：这会同时重建当前前端、Go 程序和 Tor/Clash 运行配置。页面更新只更换程序；单独拉取旧镜像或重建旧镜像容器不能代替源码升级。
 - 访问 GitHub 需要代理时，在同一页面配置**全局代理**即可，更新链路会走它。更新只从 GitHub 域名下载并强制 HTTPS。
 
 ### 方式二：一键更新脚本
 
 ```bash
-cd ARTEX
+cd ARTEX1
 ./update.sh
 ```
 
 脚本先可选 `git pull` 拉取最新代码，再让你选 **① Docker 更新** 或 **② 本地编译更新**（与 `install.sh` 对应）：
 
-- **① Docker**：可指定目标镜像 tag（回车沿用 `.env` 的 `ARTEX_TAG`，缺省 `latest`）→ `docker compose pull` → `docker compose up -d`（换新镜像重启即自动迁移）。
+- **① Docker**：调用 `./rebuild-local.sh`，从当前源码依次构建基础镜像和 Tor/Clash 镜像，启动并等待服务健康（重启自动迁移）。
 - **② 本地**：重建前端静态产物 → 重新编译 `./artex`（完成后重启进程生效）。
 
-### 方式三：Docker Compose（手动）
+### 方式三：Docker 源码重建
 
 ```bash
-cd ARTEX
-git pull                       # 更新 compose / 脚本（可选）
-# 指定版本：在 .env 设 ARTEX_TAG=v0.2.0；不设则用 latest
-docker compose pull artex
-docker compose up -d artex     # 换新镜像重启 → 自动迁移 schema
-docker image prune -f          # 清理旧镜像（可选）
+cd ARTEX1
+git pull --ff-only             # 从包含所需改动的仓库更新源码（可选）
+./rebuild-local.sh             # 构建并启动当前前端、后端和 Tor/Clash 镜像
 ```
 
 ### 方式四：预编译二进制（Releases）
@@ -292,7 +318,7 @@ server {
 单个 daemon 的问题不是匿名性，而是**换电路是进程级**的：一个 Agent 想换 IP，会把所有 Agent 的电路一起换掉。实例池让每个 Agent 落在自己的 daemon 上。
 
 - 「系统设置」页的「Tor 出口」（单 daemon + `严格模式（fail-closed）`）与「Tor 实例池（每 Agent 独立出口）」两个区块，对应设置项：`tor_pool_enabled`、`tor_pool_size`（1–32，默认 5）、`tor_pool_socks_base`、`tor_pool_control_base`、`tor_pool_dir`、`tor_pool_upstream`。
-- slot N 的端口 = `base + N - 1`；Agent 通过**稳定哈希**固定到某个 slot（`agents.egress_tor_instance`，1-based；`0` = 回落到单 daemon）。
+- slot N 的端口 = `base + N - 1`；`agents.egress_tor_instance` 为 1-based 固定槽位，`0` 表示在已启用的池中按 Agent 的**稳定哈希**自动分配。仅禁用实例池时才可使用已配置的单 daemon；已启用的池停止时拒绝请求。
 - 启动**全有或全无**：任一 slot 起不来就整池失败，不留「一半在 Tor 上」的状态。
 - 就绪判定用控制口 `GETINFO status/bootstrap-phase` 要求 `PROGRESS=100`——**TCP 能连 ≠ 已可用**，这是实测踩出来的。
 - 重启后通过 `GETINFO config-file` 认领自己上一轮遗留的 daemon（cookie 不能先删，它就是认领凭证），端口冲突不再把启动打挂。
@@ -306,7 +332,7 @@ server {
 
 ### Agent 级出口配置与审计
 
-「Agent 管理 → 出口」页签：出口策略（`direct` / `proxy` / `tor`）、Tor 出口国家偏好、固定实例、**出口实测**（拉最近几次 run 直接显示 `is_tor` 真/假）、**换电路**按钮（UI 明确提示：共享 daemon 时换电路是全局的）。严格模式（`egress_strict`）在这里是只读告警：开启且当前没有可用匿名出口时，页签内会直接提示所有触达目标的工具都将被拒绝。
+「Agent 管理 → 出口」页签：出口策略（`inherit` / `tor` / `clash` / `proxy`）、Tor 出口国家偏好、固定实例、**出口实测**（拉最近几次 run 直接显示 `is_tor` 真/假）、**换电路**按钮（UI 明确提示：共享 daemon 时换电路是全局的）。严格模式（`egress_strict`）在这里是只读告警：开启且当前没有可用匿名出口时，页签内会直接提示所有触达目标的工具都将被拒绝。
 
 每次 run 的解析结果落在 `agent_egress_runs`：
 
@@ -325,8 +351,8 @@ server {
 解析器的工具。仓库内置一套容器级透明代理（`deploy/artex-entry.sh` + `deploy/tor-shim.sh`），
 由 `Dockerfile.tor` 打进镜像，`docker-compose.override.yml` 授予 `NET_ADMIN`：
 
-- `nat OUTPUT`：TCP 全量 `REDIRECT` 到 tor `TransPort(9040)`；`udp/tcp 53` 重定向到 `DNSPort(19053)`；
-- `filter OUTPUT`：其余 UDP/ICMP 直接丢弃（Tor 不承载 UDP，宁可失败也不真实出网）；
+- `nat OUTPUT`：公网 TCP `REDIRECT` 到 tor `TransPort(9040)`；UDP 53 重定向到 `DNSPort(19053)`；
+- `filter OUTPUT`：TCP DNS 及其余公网 UDP/ICMP 明确拒绝（Tor 不承载普通 UDP，不能回退真实出口）；
 - tor 以独立用户 `artestor` 运行，iptables 用 `-m owner --uid-owner` 放行 tor 自身流量，避免自套成环；
 - 放行 loopback / 容器内网 / 已建立连接，`8787`、`8788` 的对外服务与 PostgreSQL 不受影响。
 
@@ -339,25 +365,38 @@ server {
 会失败而不是泄漏；`ARTEX_TRANSPARENT_TOR=0` 可临时关闭排障。tor `DNSPort` 只实现了 A/AAAA/PTR，
 `TXT/MX/NS/SRV` 查询会返回 `NOTIMP`。直连白名单按 IP 生效，模型端点换 IP 时需要同步更新。
 
-### 临时换出口：内置 Clash(mihomo)
+### Tor 主出口、Clash 指定出口与受控备用
 
-Tor 出口有时会被目标或网络拦截，测试需要临时换一条出口。镜像内置 mihomo（Clash.Meta），
-以独立用户 `clash`（uid 912）运行，并在 iptables 中**按 uid 豁免**——否则 Clash 自己的上游
-连接也会被容器的透明 Tor 劫持，Tor 被封时等于不可用。其它流量的 Tor 规则不变。
+目标请求统一经过应用路由网关。顺序为：已有平台/内网白名单 → 任务显式选择 → Agent 显式选择 → 从上到下的目标规则 → 默认 Tor。安全限制始终生效；目标直连被拒绝。平台白名单继续由 `ARTEX_DIRECT_IPS`、固定 hosts 和现有内网策略管理。旧 `global_proxy` 不再覆盖目标规则；需要自定义代理时显式选择任务或 Agent 的 `proxy`。
 
-- 本地入站：`mixed-port 127.0.0.1:7890`（HTTP + SOCKS 同一端口），控制口 `127.0.0.1:9090`，
-  均只绑回环；DNS 用 mihomo 内置 DoH（`127.0.0.1:1053`），不依赖系统 resolver。
-- 工具临时改走 Clash：`export ALL_PROXY=socks5h://127.0.0.1:7890`，或 `curl -x http://127.0.0.1:7890`。
-- 下发订阅（**在宿主机执行**，容器内下载会走 Tor，订阅站多封 Tor）：
-  ```bash
-  cd /opt/ARTEX1 && ./deploy/clash-set-subscription.sh '<订阅URL>'
-  ```
-  脚本会丢弃订阅自带的入站/控制器/dns 配置，强制回环绑定并注入内置 DoH，然后热重启 mihomo。
-- 无订阅时使用 `/etc/mihomo/base.yaml`（全部直连）占位，`mixed-port` 也能用来验证连通性。
-- 订阅规则常含 `GEOIP,CN,DIRECT`，mihomo 会去下载 MMDB；镜像已预置 GEO 数据库
-  （`/etc/mihomo/geo`），启动脚本在数据目录缺失时自动补齐，避免首次启动联网失败。
-- 切节点/测延迟走控制口：`GET /proxies`、`GET /proxies/<名>/delay?timeout=5000&url=http://www.gstatic.com/generate_204`、
-  `PUT /proxies/<策略组>` body `{"name":"<节点>"}`；规则引用的主策略组是订阅里的 `TapFog`。
+在「系统 → 设置 → Tor 主出口与 Clash 备用」中查看状态、编辑域名/IP 规则、检测出口和查看审计。在任务详情或 Agent 的出口设置中可选择 `inherit`、`tor`、`clash`，切换作用于新请求和新连接；已经建立的 CONNECT 隧道在关闭前保持原出口。
+
+- `domain` 匹配完整域名，`suffix` 匹配该域及其子域；`ip` / `cidr` 只匹配 URL 中直接使用的 IP，不额外执行本地 DNS。
+- 自动备用默认关闭，默认阈值 3 次、冷却 300 秒。必须同时开启全局备用和某条 Tor 目标规则的「允许备用」；明确指定 Tor 的任务/Agent 不自动切换。仅连接或代理错误累计失败，普通 HTTP 403/429 不触发自动重放，需要人工切换。
+- 冷却期间该任务/Agent/目标使用 Clash；冷却结束后的新请求重新尝试 Tor。HTTP 仅无请求体的 GET/HEAD 可自动再试一次；POST 等不会自动重放。HTTPS CONNECT 只在未建立目标隧道、未发送目标内容之前允许换出口。
+- WebFetch、受控 HTTP 工具和录流代理使用相同的任务/Agent 路由上下文。无法保证遵循 Clash 或目标规则的 Bash、交互 shell、命令/脚本和 MCP 工具会明确拒绝执行；纯 Tor 模式的本地命令保留容器防火墙的透明覆盖。尚无受控适配的 MCP 工具统一拒绝，避免共享代理或远程执行丢失任务出口。UDP 工具拒绝执行。第三方搜索 API 和模型等现有平台查询保留平台策略。
+- 出口身份独立于代理协议。SOCKS 地址不代表 Tor；检测使用 Tor 官方 API 的 IP 与 `IsTor`。每次请求审计记录提供商、规则和原因；审计 IP 为同一提供商/上下文的独立出口检测，缓存 60 秒，标注 `same-provider-probe`，不冒充目标端逐条观测。需要逐条核验时使用受控回连平台。
+
+容器内置 Mihomo，以独立 uid 912 运行；入口 `127.0.0.1:7890`（HTTP/SOCKS），控制口 `127.0.0.1:9090`，均不发布。首次部署 Clash 默认关闭；在 `.env` 设置 `ARTEX_CLASH_ENABLED=1` 后重建启动。已有宿主机实际代理可通过 `ARTEX_CLASH_UPSTREAM=http://host.docker.internal:7897` 初始化一个 HTTP 代理节点；已保存的节点优先。
+
+也可以在项目根目录导入包含真实 `proxies` 的 Clash YAML：
+
+```bash
+./deploy/clash-set-subscription.sh '<订阅URL>'
+# 或从本地文件导入，避免把订阅地址写入命令历史
+./deploy/clash-set-subscription.sh --file /path/to/nodes.yaml
+```
+
+导入器只保留实际代理节点，丢弃订阅规则、组、providers、TUN 和脚本；统一生成 `MATCH,CLASH_OUT`，选择组只包含真实节点，空组使用 `REJECT`。没有订阅/节点、配置不符合严格策略、代理失败时拒绝连接，不存在 DIRECT 兜底。仅含 `proxy-providers` 的配置需先展开节点。
+
+节点、运行配置和随机控制密钥位于独立 `clashstate:/var/lib/artex-clash`，权限 0600；不进入可浏览的 `data/`。旧 `data/clash/config.yaml` 只读取迁移，保留原文件。路由规则持久化到 PostgreSQL，Tor 状态保留原 `torstate`。控制接口需要 `controller.secret`，不要将密钥或节点配置贴入日志。
+
+```bash
+./rebuild-local.sh
+python3 test/regression/docker_egress_routing_check.py --output /tmp/artex-egress-check.json
+```
+
+回归会临时切换规则并模拟代理故障，结束后恢复服务与配置。请在空闲时运行。停用 Clash 时修改 `.env` 的 `ARTEX_CLASH_ENABLED=0`，再重建/重新创建容器，指定 Clash 的请求将被拒绝。
 
 ### 「配了 Tor 却还是真实 IP」——已修的四个坑
 
@@ -382,20 +421,61 @@ Tor 出口有时会被目标或网络拦截，测试需要临时换一条出口�
 
 ### 验证方法（怎么证明「真的在走 Tor」）
 
+Docker 部署从项目根目录运行以下检查，使用现有 `jwt.key` 临时签名认证，不需要手工准备 JWT。脚本会短暂停止 Tor 池并在 `finally` 中尝试恢复，应避开正在执行的任务；结束后检查报告中的恢复结果和 `docker compose ps`。
+
 ```bash
-# 1) 实例池单测 + 真实 Tor 端到端（需要本机 tor）
+# 核心检查：每个 slot 的官方 Tor 检测、透明 curl/Python/Node、应用请求、停池阻断
+python3 test/regression/docker_tor_check.py --core-only --output /tmp/artex-docker-tor-core-check.json
+
+```
+
+`--core-only` 不发送回调，也不读取回调日志。退出码和 `core_ok` 只反映核心检查，报告的 `ok=false` 表示完整回调验证未完成。完整检查必须全部通过才会记录 `ok=true`；回调服务不可用时不能据此宣称验证通过。池大小不是 5 时，使用 `--expected-slots <实际数量>`；宿主机端口调整后使用 `--base-url http://127.0.0.1:<端口>`。
+
+完整检查推荐使用自己的 Webhook.site token。先在宿主机通过免费 [`POST /token`](https://docs.webhook.site/api/tokens.html#create-token) 创建 token，再把响应中的 `uuid` 传给脚本；脚本本身不会创建 token：
+
+```bash
+TOR_WEBHOOK_TOKEN="$(
+  curl -fsS -X POST https://webhook.site/token \
+    -H 'Content-Type: application/json' -d '{}' |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["uuid"])'
+)"
+python3 test/regression/docker_tor_check.py \
+  --callback-provider webhook-site --callback-token "$TOR_WEBHOOK_TOKEN" \
+  --output /tmp/artex-docker-tor-webhook-check.json
+
+# 查看同一 token 的请求日志
+curl -fsS "https://webhook.site/token/${TOR_WEBHOOK_TOKEN}/requests?sorting=newest&per_page=100"
+```
+
+Webhook.site 的 HTTP/HTTPS 回调使用 `<UUID>.webhook.site`；日志中的 `type=web` 才参与 HTTP 出口判断。也可用 `--callback-host` / `--callback-api` 覆盖所选服务的回调地址与日志接口。已有 CVSSAdvisor 实例可显式选择 `--callback-provider cvss` 并指定这两个参数；旧实例失效时应新建实例或更换平台。
+
+如需另行核验 DNS 解析链路，同一 token 支持 [DNSHook](https://docs.webhook.site/dnshook.html)：在容器内查询带唯一标记的 `<标记>.<UUID>.dnshook.site`，然后在同一日志接口查看 `type=dns` 事件。例如：
+
+```bash
+docker compose exec -T artex python3 -c '
+import socket, sys
+try:
+    print(socket.getaddrinfo(sys.argv[1], 80, type=socket.SOCK_STREAM))
+except socket.gaierror as error:
+    print(f"DNS response: {error}")
+' "artex-dns-$(date +%s).${TOR_WEBHOOK_TOKEN}.dnshook.site"
+```
+
+DNSHook 没有配置有效 A/AAAA 响应时，解析失败仍可能留下查询日志。此手动查询不属于 `docker_tor_check.py` 的自动检查范围。交叉核验时：
+
+- HTTP/HTTPS 日志的源 IP 必须属于 [Tor 出口列表](https://check.torproject.org/torbulkexitlist)，并按本轮唯一标记关联请求；CVSSAdvisor 与 Webhook.site 的原始事件类型字段不同，脚本会统一处理。
+- DNSHook 的 `type=dns` 源 IP 可能属于 Tor 出口使用的递归解析器。DNS 日志只核验解析链路，不能用递归解析器 IP 判断 HTTP 出口或单独判定泄漏。
+- 停池测试还必须证明 SOCKS、预解析公网目标 TCP 和应用请求都失败；完整检查会观察停池期间的唯一标记，确认没有收到对应 HTTP 回调。HTTP 日志中出现宿主机或上游代理出口属于失败。
+
+开发环境还可运行实例池单测和真实 Tor 端到端测试（后者需要本机 `tor`），以及已有功能回归：
+
+```bash
 go test ./torpool/
 go test -tags e2e ./torpool/ ./server/
 
-# 2) 完整回归（41 项断言，需要后端已启动并准备好 JWT）
-ARTEX_BASE=http://127.0.0.1:8899 ARTEX_TOKEN_FILE=/tmp/token.txt ./test/regression/tor_features.sh
+# 后端已启动，并准备好 JWT 文件；端口按实际部署修改
+ARTEX_BASE=http://127.0.0.1:8787 ARTEX_TOKEN_FILE=/tmp/token.txt ./test/regression/tor_features.sh
 ```
-
-用自己的可控观测点（自建回显服务、dnslog、httpworkbench 实例等）交叉验证时：
-
-- **只信 HTTP 台账**：`type=http` 那批的源 IP 必须全部落在 [Tor 出口列表](https://check.torproject.org/torbulkexitlist) 内。
-- `type=dns` 行的 `address` 是**解析器**而不是客户端：出口自己解析就是出口 IP；出口把递归转给 Cloudflare / Google 时就是那家递归器的地址。它无法反推你的真实 IP，同样也不能当作泄漏证据。
-- 判定「有没有泄漏」的硬指标只有一条：本机出口 IP（对照 Clash / 系统代理的出口地址）**一次都不该出现**。
 
 > 设计细节、缺陷复盘与测试计划见 [docs/TOR-AGENT-EGRESS-DESIGN.md](docs/TOR-AGENT-EGRESS-DESIGN.md)。
 

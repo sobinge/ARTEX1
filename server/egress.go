@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egressroute"
 	"github.com/Autumn-27/artex/torpool"
 )
 
@@ -46,7 +47,10 @@ var defaultIntelHosts = []string{
 
 // EgressPlan is the resolved egress for one agent run.
 type EgressPlan struct {
-	Mode        string `json:"mode"`      // direct | proxy | tor
+	Mode        string `json:"mode"` // direct | proxy | tor | clash
+	Provider    string `json:"provider,omitempty"`
+	RuleID      string `json:"rule_id,omitempty"`
+	Reason      string `json:"reason,omitempty"`
 	ProxyURL    string `json:"proxy_url"` // what SetProxy receives; socks5h for tor
 	CACert      string `json:"ca_cert,omitempty"`
 	IsTor       bool   `json:"is_tor"`
@@ -58,7 +62,7 @@ type EgressPlan struct {
 }
 
 // Anonymous reports whether this plan hides the platform's real IP.
-func (p EgressPlan) Anonymous() bool { return p.IsTor || p.Mode == "proxy" }
+func (p EgressPlan) Anonymous() bool { return p.IsTor || p.Mode == "proxy" || p.Mode == "clash" }
 
 // EgressError describes a refused egress. The UI surfaces it verbatim; it is
 // deliberately explicit about NOT falling back to a direct connection.
@@ -133,13 +137,15 @@ const blackholeProxy = "socks5h://127.0.0.1:1"
 
 // egressProxyFor returns the proxy address plus CA for SetProxy.
 //
-// Capture on: agents must point at the recording MITM (that is where traffic is
-// captured); the MITM's own upstream is the global egress. Per-agent Tor is not
-// available in that mode — a documented limitation, not an oversight.
+// The routing gateway carries the task and Agent context. Capture inserts the
+// recording MITM before that same gateway, retaining its authenticated context.
 //
 // Capture off: the resolved per-agent egress is injected directly; an unresolved
 // strict egress becomes a black hole rather than a direct connection.
 func (s *Server) egressProxyFor(key, taskID string) (string, string) {
+	if s.m.routing != nil {
+		return s.m.routing.proxyURL(egressroute.Binding{TaskID: taskID, AgentKey: key}, true), s.m.ProxyCACert()
+	}
 	if s.m.TrafficEnabled() {
 		return s.m.ProxyAddr(), s.m.ProxyCACert()
 	}
@@ -156,11 +162,24 @@ func (s *Server) egressProxyFor(key, taskID string) (string, string) {
 // torEgressFor reports whether this agent's traffic goes through Tor, plus the
 // exit country, for prompt injection.
 func (s *Server) torEgressFor(key, taskID string) (bool, string) {
+	if s.m.routing != nil {
+		b, err := s.m.routing.binding(egressroute.Binding{TaskID: taskID, AgentKey: key})
+		if err != nil || b.Mode == "clash" || b.Mode == "proxy" {
+			return false, ""
+		}
+		if b.Mode == "" || b.Mode == "inherit" {
+			for _, rule := range s.m.routing.router.Config().Rules {
+				if rule.Enabled && (rule.Provider == egressroute.ProviderClash || rule.AllowFallback) {
+					return false, ""
+				}
+			}
+		}
+		return true, ""
+	}
 	if s.m.TrafficEnabled() {
 		// Recording MITM: its upstream is the global proxy. Treat a SOCKS
 		// upstream as Tor for prompt purposes.
-		gp := strings.ToLower(strings.TrimSpace(s.m.GlobalProxy()))
-		return strings.HasPrefix(gp, "socks5"), ""
+		return false, ""
 	}
 	plan, err := s.agentEgress(key, taskID)
 	if err != nil {
@@ -171,6 +190,11 @@ func (s *Server) torEgressFor(key, taskID string) (bool, string) {
 
 // egressBinding is the ChatAgent resolver: per-agent address + Tor flag.
 func (s *Server) egressBinding(agentKey string) (string, string, bool, string) {
+	if s.m.routing != nil {
+		proxy, ca := s.egressProxyFor(agentKey, "")
+		tor, country := s.torEgressFor(agentKey, "")
+		return proxy, ca, tor, country
+	}
 	if s.m.TrafficEnabled() {
 		tor, country := s.torEgressFor(agentKey, "")
 		return s.m.ProxyAddr(), s.m.ProxyCACert(), tor, country
@@ -204,25 +228,35 @@ func (s *Server) resolveEgress(a *db.Agent, taskID string) (EgressPlan, error) {
 	}
 	if mode == "" || mode == "inherit" {
 		if gp := strings.TrimSpace(s.m.GlobalProxy()); gp != "" {
-			plan := EgressPlan{Mode: "proxy", ProxyURL: gp}
-			if strings.HasPrefix(strings.ToLower(gp), "socks5") {
-				plan.Mode = "tor"
-				plan.IsTor = true
-				plan.ProxyURL = torSocksURL(gp, "")
-			}
+			plan := EgressPlan{Mode: "proxy", Provider: "proxy", ProxyURL: gp}
 			return plan, nil
 		}
-		if s.m.EgressStrict() {
+		if s.m.TorPoolEnabled() {
+			// An enabled pool is the default anonymous egress when no explicit
+			// global proxy was saved. Continue through the same per-agent slot
+			// and circuit-isolation logic as an explicit Tor selection.
+			mode = "tor"
+		} else if s.m.EgressStrict() {
 			return EgressPlan{}, &EgressError{
 				Class:  ClassTargetProbe,
 				Agent:  agentKey,
 				Reason: "未配置匿名出口（egress_strict 已开启）",
 			}
+		} else {
+			return EgressPlan{Mode: "direct"}, nil
 		}
-		return EgressPlan{Mode: "direct"}, nil
 	}
 
 	switch mode {
+	case "clash":
+		if s.m.routing == nil {
+			return EgressPlan{}, &EgressError{Class: ClassTargetProbe, Agent: agentKey, Reason: "Clash 路由尚未启动"}
+		}
+		proxy, err := s.m.routing.resolveProxy(context.Background(), egressroute.Binding{TaskID: taskID, AgentKey: agentKey}, egressroute.ProviderClash)
+		if err != nil {
+			return EgressPlan{}, err
+		}
+		return EgressPlan{Mode: "clash", Provider: "clash", ProxyURL: proxy}, nil
 	case "direct":
 		// Explicit per-agent choice. Still refused for target-probe when the
 		// system is strict: "I picked direct" is not a reason to leak the IP.
@@ -238,23 +272,30 @@ func (s *Server) resolveEgress(a *db.Agent, taskID string) (EgressPlan, error) {
 		if strings.TrimSpace(proxy) == "" {
 			return EgressPlan{}, &EgressError{Class: ClassTargetProbe, Agent: agentKey, Reason: "egress_mode=proxy 但未填代理地址"}
 		}
-		return EgressPlan{Mode: "proxy", ProxyURL: proxy}, nil
+		return EgressPlan{Mode: "proxy", Provider: "proxy", ProxyURL: proxy}, nil
 	case "tor":
 		// Pooled mode: the agent's slot decides the SOCKS port, so both the exit
 		// and SIGNAL NEWNYM are scoped to that agent only.
 		var inst *torpool.Instance
-		if pool := s.m.TorPool(); pool != nil {
+		if s.m.TorPoolEnabled() {
+			pool := s.m.TorPool()
+			if pool == nil || !pool.Started() {
+				return EgressPlan{}, &EgressError{Class: ClassTargetProbe, Agent: agentKey,
+					Reason: "Tor 实例池尚未就绪或已停止"}
+			}
 			override := 0
 			if a != nil {
 				override = a.EgressTorInstance
 			}
 			inst = pool.For(agentKey, override)
+			if inst == nil || !inst.Running() {
+				return EgressPlan{}, &EgressError{Class: ClassTargetProbe, Agent: agentKey,
+					Reason: "分配的 Tor 实例不可用"}
+			}
 		}
 		base := strings.TrimSpace(s.m.TorSocksAddr())
 		if inst != nil {
 			base = "socks5h://" + inst.SocksAddr
-		} else if base == "" {
-			base = strings.TrimSpace(s.m.GlobalProxy())
 		}
 		if base == "" {
 			return EgressPlan{}, &EgressError{Class: ClassTargetProbe, Agent: agentKey, Reason: "egress_mode=tor 但未配置 Tor SOCKS 地址"}
@@ -269,7 +310,7 @@ func (s *Server) resolveEgress(a *db.Agent, taskID string) (EgressPlan, error) {
 			}
 		}
 		plan := EgressPlan{
-			Mode: "tor", ProxyURL: torSocksURL(base, user),
+			Mode: "tor", Provider: "tor", ProxyURL: torSocksURL(base, user),
 			IsTor: true, CircuitUser: user, ExitCountry: country,
 		}
 		if inst != nil {
@@ -334,6 +375,18 @@ func (s *Server) beginEgressAudit(taskID, agentKey string) func(error) {
 	if s.m.pg == nil {
 		return nil
 	}
+	if s.m.routing != nil {
+		// A run can visit targets using different rules and providers. Keep the
+		// run-level record neutral; per-request routing events hold the observed
+		// provider, rule, failure reason and separately measured exit IP.
+		id, err := s.m.pg.StartEgressRun(agentKey, "routed", "按目标选路；详见出口路由审计", &taskID, nil)
+		if err != nil {
+			return nil
+		}
+		return func(error) {
+			_, _ = s.m.pg.Exec(`UPDATE agent_egress_runs SET ended_at=now() WHERE id=$1`, id)
+		}
+	}
 	var agent *db.Agent
 	if got, err := s.m.pg.GetAgentByKey(agentKey); err == nil {
 		agent = got
@@ -395,7 +448,7 @@ func validTaskEgress(mode, proxy string) (string, string, error) {
 	switch mode {
 	case "", "inherit":
 		return "inherit", "", nil
-	case "tor", "direct":
+	case "tor", "clash", "direct":
 		return mode, "", nil
 	case "proxy":
 		if proxy == "" {
@@ -409,7 +462,7 @@ func validTaskEgress(mode, proxy string) (string, string, error) {
 		}
 		return mode, proxy, nil
 	default:
-		return "", "", fmt.Errorf("egress_mode 需为 inherit/tor/proxy/direct")
+		return "", "", fmt.Errorf("egress_mode 需为 inherit/tor/clash/proxy/direct")
 	}
 }
 
@@ -446,6 +499,10 @@ func (s *Server) putTaskEgress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	log.Printf("[task] #%d 出口覆盖: mode=%s proxy=%s", id, mode, proxy)
+	if s.m.routing != nil {
+		s.m.routing.router.CloseIdleConnections()
+		s.m.routing.recordPolicyChange("manual-task-switch", idStr, "", mode)
+	}
+	log.Printf("[task] #%d 出口覆盖: mode=%s proxy=%s", id, mode, redactProxyHint(proxy))
 	writeJSON(w, 200, map[string]any{"ok": true, "egress_mode": mode, "egress_proxy": proxy})
 }

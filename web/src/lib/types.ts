@@ -929,6 +929,63 @@ export interface TorPoolStatus {
   instances: TorPoolInstance[];
 }
 
+// ---- Target egress routing ----
+export type EgressProvider = "tor" | "clash";
+export type EgressRuleType = "domain" | "suffix" | "ip" | "cidr";
+
+export interface EgressRoutingRule {
+  id: string;
+  type: EgressRuleType;
+  value: string;
+  provider: EgressProvider;
+  allow_fallback: boolean;
+  enabled: boolean;
+}
+
+export interface EgressRoutingConfig {
+  rules: EgressRoutingRule[];
+  fallback: {
+    enabled: boolean;
+    failure_threshold: number;
+    cooldown_seconds: number;
+  };
+  clash_proxy: string;
+}
+
+export interface EgressRoutingStatus {
+  tor: { ready: boolean; size: number; running: number };
+  clash: { enabled: boolean; ready: boolean; node_count: number; selected: string; error?: string };
+  fallback_states: {
+    task_id?: string;
+    agent_key?: string;
+    host?: string;
+    provider?: string;
+    failures?: number;
+    fallback_until?: string;
+  }[];
+}
+
+export interface EgressRoutingAudit {
+  timestamp: string;
+  task_id: string;
+  agent_key: string;
+  host: string;
+  provider: string;
+  rule_id: string;
+  reason: string;
+  error?: string;
+  exit_ip?: string;
+  exit_ip_source?: string;
+  is_tor?: boolean;
+}
+
+export interface EgressRoutingTestResult {
+  ok: boolean;
+  resolved?: { provider: string; rule_id?: string; reason?: string; mode?: string; proxy_url?: string };
+  probe?: EgressProbe;
+  error?: string;
+}
+
 // ---- App settings (runtime toggles) ----
 export interface Settings {
   traffic_capture: boolean;
@@ -1165,8 +1222,8 @@ export interface Agent {
   trigger_run_mode?: "serial" | "parallel"; // 串行排队 / 每次触发各自并发一个会话
   trigger_merge_mode?: "by_task" | "all" | "none"; // 仅 serial：同任务合并 / 全部合并 / 不合并
   trigger_max_parallel?: number; // 仅 parallel：每 agent 并发上限；0=不限
-  // 出口策略(Tor)：inherit=跟随系统默认；direct；proxy；tor
-  egress_mode?: "inherit" | "direct" | "proxy" | "tor";
+  // 出口策略：inherit=跟随系统规则；tor / clash 为明确选择；proxy 为兼容的自定义代理
+  egress_mode?: "inherit" | "direct" | "proxy" | "tor" | "clash";
   egress_proxy?: string;
   tor_exit_country?: string;
   tor_rotate?: "off" | "per_run" | "per_intent" | "per_task";
@@ -1667,12 +1724,14 @@ export interface EgressProbe {
 }
 
 export interface ResolvedEgress {
-  Mode: string;
-  ProxyURL: string;
-  CACert?: string;
-  IsTor?: boolean;
-  CircuitUser?: string;
-  ExitCountry?: string;
+  mode: string;
+  proxy_url: string;
+  provider?: string;
+  ca_cert?: string;
+  is_tor?: boolean;
+  circuit_user?: string;
+  exit_country?: string;
+  tor_instance?: number;
 }
 
 export interface EgressRun {

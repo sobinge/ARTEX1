@@ -2,6 +2,8 @@
 
 import * as React from "react";
 
+import { toast } from "sonner";
+
 import {
   ActivityIcon,
   AlertTriangleIcon,
@@ -105,6 +107,34 @@ function StatCard({
 
 export function OverviewTab({ taskId }: { taskId: string }) {
   const [task, setTask] = React.useState<Task | null>(null);
+  const [egressSaving, setEgressSaving] = React.useState(false);
+  const [egressMode, setEgressMode] = React.useState("inherit");
+  const [egressProxy, setEgressProxy] = React.useState("");
+  const [egressEditing, setEgressEditing] = React.useState(false);
+
+  React.useEffect(() => {
+    if (egressEditing) return;
+    setEgressMode(task?.egress_mode || "inherit");
+    setEgressProxy(task?.egress_proxy || "");
+  }, [task?.egress_mode, task?.egress_proxy, egressEditing]);
+
+  async function saveTaskEgress() {
+    if (egressMode === "proxy" && !egressProxy.trim()) {
+      toast.error("请填写自定义代理地址");
+      return;
+    }
+    setEgressSaving(true);
+    try {
+      const saved = await api.setTaskEgress(taskId, egressMode, egressMode === "proxy" ? egressProxy.trim() : "");
+      setTask((previous) => previous ? { ...previous, egress_mode: saved.egress_mode, egress_proxy: saved.egress_proxy } : previous);
+      setEgressEditing(false);
+      toast.success("已切换任务出口，对之后的新请求生效");
+    } catch (error) {
+      toast.error(`切换任务出口失败：${(error as Error).message}`);
+    } finally {
+      setEgressSaving(false);
+    }
+  }
   const [stats, setStats] = React.useState<Stats | null>(null);
   const [intents, setIntents] = React.useState<TaskNode[]>([]);
   const [findings, setFindings] = React.useState<Finding[]>([]);
@@ -455,10 +485,33 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                 ? "继承 Agent 策略"
                 : task.egress_mode === "tor"
                   ? "强制 Tor"
-                  : task.egress_mode === "proxy"
-                    ? `指定代理 ${task.egress_proxy || ""}`
-                    : task.egress_mode}
+                  : task.egress_mode === "clash"
+                    ? "指定 Clash"
+                    : task.egress_mode === "proxy"
+                      ? "自定义代理"
+                      : task.egress_mode}
             </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <NativeSelect aria-label="任务出口" value={egressMode} disabled={!task || egressSaving} onChange={(event) => {
+                setEgressMode(event.target.value);
+                setEgressEditing(true);
+              }}>
+                <NativeSelectOption value="inherit">继承 Agent 与目标规则</NativeSelectOption>
+                <NativeSelectOption value="tor">指定 Tor</NativeSelectOption>
+                <NativeSelectOption value="clash">指定 Clash</NativeSelectOption>
+                <NativeSelectOption value="proxy">自定义代理（兼容）</NativeSelectOption>
+                {task?.egress_mode === "direct" && <NativeSelectOption value="direct">直连（受安全策略限制）</NativeSelectOption>}
+              </NativeSelect>
+              {egressMode === "proxy" && (
+                <Input aria-label="任务自定义代理地址" className="h-8 w-72 font-mono text-xs" value={egressProxy} disabled={egressSaving} autoComplete="off"
+                  placeholder="http://host:port" onChange={(event) => { setEgressProxy(event.target.value); setEgressEditing(true); }} />
+              )}
+              <Button type="button" size="sm" variant="outline" disabled={!task || !egressEditing || egressSaving} onClick={saveTaskEgress}>
+                {egressSaving ? "切换中…" : "切换出口"}
+              </Button>
+              {egressEditing && <Button type="button" size="sm" variant="ghost" disabled={egressSaving} onClick={() => setEgressEditing(false)}>取消</Button>}
+            </div>
+            <p className="text-muted-foreground text-xs">明确选择优先于 Agent 与目标规则；不改变正在进行的连接，出口不可用时拒绝连接。</p>
           </div>
         </CardContent>
       </Card>

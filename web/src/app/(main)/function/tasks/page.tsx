@@ -3087,8 +3087,8 @@ function CreateTaskSheet({
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
   const [coverageEnabled, setCoverageEnabled] = React.useState(true);
-  // 任务级出口覆盖：默认继承 Agent（Tor）；proxy=本任务临时走 Clash 等代理
-  const [egressMode, setEgressMode] = React.useState<"inherit" | "tor" | "proxy">("inherit");
+  // 任务级出口覆盖：默认继承 Agent/目标规则；clash 显式使用系统 Clash 出口
+  const [egressMode, setEgressMode] = React.useState<"inherit" | "tor" | "clash" | "proxy">("inherit");
   const [egressProxy, setEgressProxy] = React.useState("http://127.0.0.1:7890"); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
@@ -3406,7 +3406,7 @@ function CreateTaskSheet({
                 </div>
                 <div className="grid gap-2">
                   <Label>任务出口（本任务专用）</Label>
-                  <Select value={egressMode} onValueChange={(v) => setEgressMode(v as "inherit" | "tor" | "proxy")}>
+                  <Select value={egressMode} onValueChange={(v) => setEgressMode(v as "inherit" | "tor" | "clash" | "proxy")}>
                     <SelectTrigger className="w-64">
                       <SelectValue />
                     </SelectTrigger>
@@ -3414,7 +3414,8 @@ function CreateTaskSheet({
                       <SelectGroup>
                         <SelectItem value="inherit">继承 Agent 策略（默认）</SelectItem>
                         <SelectItem value="tor">强制走 Tor</SelectItem>
-                        <SelectItem value="proxy">指定代理（Clash）</SelectItem>
+                        <SelectItem value="clash">指定 Clash（仅代理节点）</SelectItem>
+                        <SelectItem value="proxy">自定义代理（兼容）</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
@@ -3427,8 +3428,8 @@ function CreateTaskSheet({
                     />
                   )}
                   <p className="text-muted-foreground text-xs">
-                    仅影响本任务，其它任务仍按各自 Agent 出口。注意：只对读取代理环境变量的工具生效
-                    （curl/httpx/nuclei/sqlmap 等）；nmap、dig 这类不读代理的工具仍由容器内核层强制走 Tor。
+                    仅影响本任务，明确选择 Tor 或 Clash 后优先于 Agent 与目标规则。出口不可用时拒绝连接；
+                    无法遵循所选出口的工具会被拒绝执行。
                   </p>
                 </div>
               </CollapsibleContent>

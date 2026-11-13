@@ -56,7 +56,19 @@ func (m *Manager) TorPoolUpstream() string {
 // It is a no-op when the pool is disabled: callers then keep using the single
 // shared daemon (backwards compatible installs).
 func (m *Manager) StartTorPool(ctx context.Context) error {
+	m.torPoolMu.Lock()
+	defer m.torPoolMu.Unlock()
+	return m.startTorPoolLocked(ctx)
+}
+
+// startTorPoolLocked replaces the process set while torPoolMu is held. Remove
+// the public reference first so requests cannot use an old pool during restart.
+func (m *Manager) startTorPoolLocked(ctx context.Context) error {
 	m.mu.Lock()
+	if m.torPoolClosed {
+		m.mu.Unlock()
+		return fmt.Errorf("Tor pool manager is closed")
+	}
 	cfg := torpool.Config{
 		Binary:        m.torBinary,
 		Dir:           m.torPoolDir,
@@ -67,15 +79,23 @@ func (m *Manager) StartTorPool(ctx context.Context) error {
 	}
 	enabled := m.torPoolEnabled
 	old := m.torPool
+	m.torPool = nil
+	startCtx, cancel := context.WithCancel(ctx)
+	m.torPoolCancel = cancel
 	m.mu.Unlock()
-
-	if !enabled {
-		if old != nil {
-			old.Stop()
-		}
+	defer func() {
+		cancel()
 		m.mu.Lock()
-		m.torPool = nil
+		m.torPoolCancel = nil
 		m.mu.Unlock()
+	}()
+
+	// Starting before stopping would adopt the old daemons and then kill the
+	// very same processes when old.Stop runs.
+	if old != nil {
+		old.Stop()
+	}
+	if !enabled {
 		return nil
 	}
 
@@ -83,13 +103,15 @@ func (m *Manager) StartTorPool(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := pool.Start(ctx); err != nil {
+	if err := pool.Start(startCtx); err != nil {
 		return err
 	}
-	if old != nil {
-		old.Stop()
-	}
 	m.mu.Lock()
+	if startCtx.Err() != nil || m.torPoolClosed {
+		m.mu.Unlock()
+		pool.Stop()
+		return fmt.Errorf("Tor pool startup canceled")
+	}
 	m.torPool = pool
 	m.mu.Unlock()
 	return nil
@@ -97,6 +119,15 @@ func (m *Manager) StartTorPool(ctx context.Context) error {
 
 // StopTorPool terminates all pooled daemons.
 func (m *Manager) StopTorPool() {
+	// Interrupt an in-progress bootstrap before waiting for the lifecycle lock.
+	m.mu.RLock()
+	cancel := m.torPoolCancel
+	m.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+	m.torPoolMu.Lock()
+	defer m.torPoolMu.Unlock()
 	m.mu.Lock()
 	pool := m.torPool
 	m.torPool = nil
@@ -147,6 +178,8 @@ func (m *Manager) SetTorPoolSettings(ctx context.Context, enabled bool, size, so
 	if dir == "" {
 		dir = fmt.Sprintf("%s/torpool", m.dir)
 	}
+	m.torPoolMu.Lock()
+	defer m.torPoolMu.Unlock()
 	set := map[string]string{
 		settingTorPoolOn:          fmt.Sprintf("%t", enabled),
 		settingTorPoolSize:        fmt.Sprintf("%d", size),
@@ -171,7 +204,12 @@ func (m *Manager) SetTorPoolSettings(ctx context.Context, enabled bool, size, so
 	m.torPoolUpstream = upstream
 	m.mu.Unlock()
 
-	return m.StartTorPool(ctx)
+	return m.startTorPoolLocked(ctx)
+}
+
+// Slots bootstrap concurrently; allow the per-slot budget plus startup margin.
+func torPoolStartupTimeout(size int) time.Duration {
+	return 150 * time.Second
 }
 
 // validateTorInstance checks a per-agent slot pin. 0 means "auto" and is always
@@ -216,7 +254,7 @@ func (s *Server) getTorPool(w http.ResponseWriter, r *http.Request) {
 
 // startTorPool (re)starts the daemons from the persisted settings.
 func (s *Server) startTorPool(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), torPoolStartupTimeout(s.m.TorPoolSize()))
 	defer cancel()
 	if err := s.m.StartTorPool(ctx); err != nil {
 		writeErr(w, 502, err.Error())
@@ -249,7 +287,7 @@ func (s *Server) updateTorPool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid JSON")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), torPoolStartupTimeout(req.Size))
 	defer cancel()
 	if err := s.m.SetTorPoolSettings(ctx, req.Enabled, req.Size, req.SocksBase, req.ControlBase,
 		strings.TrimSpace(req.Dir), strings.TrimSpace(req.Binary), strings.TrimSpace(req.Upstream)); err != nil {

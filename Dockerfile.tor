@@ -10,14 +10,15 @@
 #     以独立用户 clash 运行并在 iptables 中按 uid 豁免，避免上游被 Tor 劫持。
 ARG BASE=artex-src:local
 FROM ${BASE}
+ARG TARGETARCH
 ARG MIHOMO_VERSION=v1.19.33
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tor iptables curl \
+ && apt-get install -y --no-install-recommends tor obfs4proxy iptables curl python3-yaml \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -r -u 910 -M -s /usr/sbin/nologin artestor \
  && useradd -r -u 912 -M -s /usr/sbin/nologin clash \
  && curl -fsSL -o /tmp/mihomo.gz \
-      "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-${MIHOMO_VERSION}.gz" \
+      "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-${TARGETARCH}-${MIHOMO_VERSION}.gz" \
  && gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo \
  && chmod 755 /usr/local/bin/mihomo && rm -f /tmp/mihomo.gz \
  && /usr/local/bin/mihomo -v
@@ -35,7 +36,10 @@ RUN chmod 755 /usr/sbin/tor-shim.sh \
  && ln -s /usr/sbin/tor-shim.sh /usr/sbin/tor \
  && tor --version | head -1
 COPY deploy/clash-config.base.yaml /etc/mihomo/base.yaml
+COPY deploy/clash-config.py /usr/local/bin/artex-clash-config.py
 COPY deploy/clash-restart.sh /usr/local/bin/artex-clash-restart.sh
 COPY deploy/artex-entry.sh /usr/local/bin/artex-entry.sh
-RUN chmod 755 /usr/local/bin/artex-clash-restart.sh /usr/local/bin/artex-entry.sh
+COPY deploy/tor-healthcheck.py /usr/local/bin/artex-tor-healthcheck.py
+RUN chmod 755 /usr/local/bin/artex-clash-config.py /usr/local/bin/artex-clash-restart.sh /usr/local/bin/artex-entry.sh
 ENTRYPOINT ["/usr/local/bin/artex-entry.sh"]
+CMD ["-addr", ":8787", "-proxy", ":8788"]

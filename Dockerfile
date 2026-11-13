@@ -2,7 +2,8 @@
 #
 # 多阶段构建：前端静态导出 → Go 单二进制（内嵌前端）→ 运行镜像。
 # 原 Docker Hub 镜像源（autumn27/artex）已失效，本仓库自此支持从纯源码自助构建：
-#   docker compose build        # 或 docker build -t artex:local .
+#   ./install.sh --docker       # 依次构建本文件与 Dockerfile.tor，并启动
+#   docker build -t artex-src:local .  # 单独构建基础应用镜像
 # TARGETARCH 由 buildx 自动注入（amd64/arm64），Go 交叉编译无需 QEMU；
 # 运行层只装工具，编译全部在构建阶段完成。
 # 国内网络可覆盖模块源（默认已对国内友好）：

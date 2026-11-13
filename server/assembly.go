@@ -209,7 +209,7 @@ func seedPrompts(pg *db.DB) {
 // tool-assembly time each built-in tool is filtered by its agent binding / enabled
 // flag and, if kept, wrapped so the model sees the DB-overridden description/schema
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
-func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
+func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool, guards ...egressToolGuard) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).
 	// No startup prune: rows we didn't seed are left alone so future user-defined
@@ -240,7 +240,7 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		rows, err := pg.ListTools()
 		if err != nil {
 			log.Printf("[tools] 读取工具表失败，按代码默认放行: %v", err)
-			return tools
+			return guardResolvedTools(ctx, agentKey, tools, nil, guards)
 		}
 		byKey := make(map[string]*db.Tool, len(rows))
 		for _, t := range rows {
@@ -320,7 +320,7 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 				}
 			}
 		}
-		return out
+		return guardResolvedTools(ctx, agentKey, out, byKey, guards)
 	}
 }
 

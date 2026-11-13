@@ -17,6 +17,7 @@ import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSend
 import type { Settings, TorPoolStatus } from "@/lib/types";
 
 import { UpdateCard } from "./_components/update-card";
+import { EgressRoutingCard } from "./_components/egress-routing-card";
 
 export default function SystemSettingsPage() {
   const [trafficCapture, setTrafficCapture] = React.useState(false);
@@ -347,6 +348,8 @@ export default function SystemSettingsPage() {
       <div className="columns-1 gap-4 md:gap-6 lg:columns-2">
         <UpdateCard />
 
+        <EgressRoutingCard />
+
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
@@ -373,6 +376,8 @@ export default function SystemSettingsPage() {
             />
           </CardContent>
         </Card>
+
+        <EgressRoutingCard />
 
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>
@@ -402,33 +407,30 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
+        <EgressRoutingCard />
+
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <RadioTowerIcon className="size-4" />
-              全局代理
+              基础出口与 Tor 实例池
             </CardTitle>
             <CardDescription>
-              所有 Agent 的<b>目标流量</b>经此代理出网（隐藏源 IP / 走跳板）。支持 <b>http / https / socks5</b>，可带{" "}
-              <code>user:pass</code> 认证。留空=直连。
+              Tor 实例池用于默认目标流量。已有的全局代理配置作为兼容设置保留，任务与 Agent 的明确选择优先。
+              流量捕获使用相同的出口策略，与网络搜索代理、LLM 代理相互独立。
               <br />
-              开启<b>流量捕获</b>时，它作为记录代理的<b>上游</b>（流量仍全量落库，再经此代理出网）；关闭捕获时，直接注入
-              Agent 的 bash / WebFetch 出网。与网络搜索代理、LLM 代理相互独立。
-              <br />
-              <b>提示</b>：socks5 在<b>关闭捕获</b>时依赖各命令行工具对 <code>ALL_PROXY</code> 的支持（curl
-              可用，部分工具可能忽略）； 若主要用 socks5，建议开启流量捕获——此路径由 MITM
-              亲自拨号，工具无感知、稳定生效。
+              兼容代理支持 <b>http / https / socks5</b> 及认证；留空时使用默认 Tor 与目标规则。
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
             <Label htmlFor="global-proxy" className="text-sm font-normal text-muted-foreground">
-              代理地址
+              兼容全局代理（可选）
             </Label>
             <div className="flex items-center gap-2">
               <Input
                 id="global-proxy"
                 autoComplete="off"
-                placeholder="socks5://user:pass@host:1080 或 http://host:port（留空=直连）"
+                placeholder="socks5://user:pass@host:1080 或 http://host:port（留空=默认出口）"
                 value={globalProxyInput}
                 disabled={!loaded || savingGlobalProxy}
                 onChange={(e) => setGlobalProxyInput(e.target.value)}
@@ -438,7 +440,7 @@ export default function SystemSettingsPage() {
               </Button>
             </div>
             <p className="text-muted-foreground text-xs">
-              {globalProxyInput.trim() ? "已配置 · 所有目标流量经此代理出网" : "未配置 · 目标流量直连出网"}
+              {globalProxyInput.trim() ? "已配置全局代理 · 显式任务与 Agent 设置优先" : "未配置全局代理 · 使用默认 Tor 与目标规则"}
             </p>
 
             <Separator className="my-3" />
@@ -864,6 +866,8 @@ export default function SystemSettingsPage() {
             )}
           </CardContent>
         </Card>
+
+        <EgressRoutingCard />
 
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>

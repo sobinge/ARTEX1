@@ -27,6 +27,31 @@ type taskAgentBundle struct {
 	pl             *agent.Planner
 	wk             *agent.Worker
 	main           *agent.MainAgent
+	egress         [3]taskAgentEgress
+}
+
+// Compare effective bindings before reusing task agents. A bundle created while
+// the pool was bootstrapping must not keep its blackhole proxy after Tor is ready.
+type taskAgentEgress struct {
+	proxy, ca, country string
+	tor                bool
+}
+
+func (s *Server) taskAgentEgressFor(agentKey, taskID string) taskAgentEgress {
+	if s.m.routing != nil {
+		proxy, ca := s.egressProxyFor(agentKey, taskID)
+		tor, country := s.torEgressFor(agentKey, taskID)
+		return taskAgentEgress{proxy: proxy, ca: ca, tor: tor, country: country}
+	}
+	if s.m.TrafficEnabled() {
+		tor, country := s.torEgressFor(agentKey, taskID)
+		return taskAgentEgress{proxy: s.m.ProxyAddr(), ca: s.m.ProxyCACert(), tor: tor, country: country}
+	}
+	plan, err := s.agentEgress(agentKey, taskID)
+	if err != nil {
+		return taskAgentEgress{proxy: blackholeProxy}
+	}
+	return taskAgentEgress{proxy: plan.ProxyURL, tor: plan.IsTor, country: plan.ExitCountry}
 }
 
 type llmAuditProfile struct {
@@ -552,7 +577,12 @@ func (s *Server) invalidateTaskAgents() {
 func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	s.taskAgentMu.Lock()
 	defer s.taskAgentMu.Unlock()
-	if bundle := s.taskAgents[t.ID]; bundle != nil {
+	egress := [3]taskAgentEgress{
+		s.taskAgentEgressFor("worker", t.ID),
+		s.taskAgentEgressFor("planner", t.ID),
+		s.taskAgentEgressFor("mainagent", t.ID),
+	}
+	if bundle := s.taskAgents[t.ID]; bundle != nil && bundle.egress == egress {
 		return bundle
 	}
 	goalRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "goals"}
@@ -568,8 +598,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
-	wk.SetProxy(s.egressProxyFor("worker", t.ID))
-	wk.SetTorEgress(s.torEgressFor("worker", t.ID))
+	wk.SetProxy(egress[0].proxy, egress[0].ca)
+	wk.SetTorEgress(egress[0].tor, egress[0].country)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
@@ -580,8 +610,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
-	pl.SetProxy(s.egressProxyFor("planner", t.ID))
-	pl.SetTorEgress(s.torEgressFor("planner", t.ID))
+	pl.SetProxy(egress[1].proxy, egress[1].ca)
+	pl.SetTorEgress(egress[1].tor, egress[1].country)
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
@@ -594,13 +624,14 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetNonStreaming(mainRuntime.nonStreaming)
 	main.SetMaxTokens(mainRuntime.maxTokens)
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	main.SetProxy(s.egressProxyFor("mainagent", t.ID))
-	main.SetTorEgress(s.torEgressFor("mainagent", t.ID))
+	main.SetProxy(egress[2].proxy, egress[2].ca)
+	main.SetTorEgress(egress[2].tor, egress[2].country)
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,
+		egress: egress,
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle
